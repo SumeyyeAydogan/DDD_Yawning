@@ -1,13 +1,9 @@
 import json
 import math
 import os
+import argparse
 
-INPUT_PATH = "artifacts/reward-landmark-soft-mj-9/optimized_gradcam_weights.json" #"artifacts/reward_soft-mask/optimized_gradcam_weights.json"
-LOG_OUTPUT_PATH = "artifacts/reward-landmark-soft-mj-9/log_weights.json"
-EXP_OUTPUT_PATH = "artifacts/reward-landmark-soft-mj-9/exp_weights.json"
-
-
-def create_log_weights(input_path=INPUT_PATH, output_path=LOG_OUTPUT_PATH):
+def create_log_weights(input_path: str, output_path: str):
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Could not find {input_path}")
 
@@ -35,7 +31,7 @@ def create_log_weights(input_path=INPUT_PATH, output_path=LOG_OUTPUT_PATH):
     print(f"[OK] log weights saved to: {output_path}")
 
 
-def create_exp_weights(input_path=INPUT_PATH, output_path=EXP_OUTPUT_PATH):
+def create_exp_weights(input_path: str, output_path: str):
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Could not find {input_path}")
 
@@ -56,5 +52,39 @@ def create_exp_weights(input_path=INPUT_PATH, output_path=EXP_OUTPUT_PATH):
 
 
 if __name__ == "__main__":
-    create_log_weights()
-    create_exp_weights()
+    parser = argparse.ArgumentParser(description="Create log/exp transformed GradCAM sample weights.")
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="Path to optimized_gradcam_weights.json",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help="Output directory. If set, outputs log_weights.json and exp_weights.json into it.",
+    )
+    parser.add_argument(
+        "--log-out",
+        default=None,
+        help="Full output path for log weights json (overrides --out-dir).",
+    )
+    parser.add_argument(
+        "--exp-out",
+        default=None,
+        help="Full output path for exp weights json (overrides --out-dir).",
+    )
+
+    args = parser.parse_args()
+
+    if args.out_dir:
+        os.makedirs(args.out_dir, exist_ok=True)
+        log_out = args.log_out or os.path.join(args.out_dir, "log_weights.json")
+        exp_out = args.exp_out or os.path.join(args.out_dir, "exp_weights.json")
+    else:
+        if not args.log_out or not args.exp_out:
+            raise SystemExit("Either provide --out-dir OR both --log-out and --exp-out.")
+        log_out = args.log_out
+        exp_out = args.exp_out
+
+    create_log_weights(args.input, log_out)
+    create_exp_weights(args.input, exp_out)

@@ -39,7 +39,7 @@ import mediapipe as mp
 PROJECT_ROOT = Path(__file__).parent.parent
 
 SOURCE_SPLIT_ROOT = PROJECT_ROOT / "ydd_splitted_dataset"
-TARGET_SPLIT_ROOT = PROJECT_ROOT / "ydd_splitted_dataset_landmark_mouth-jaw-11"
+TARGET_SPLIT_ROOT = PROJECT_ROOT / "ydd_splitted_dataset_landmark_mouth-jaw-10-px-pad-keep-aspect"
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 CLASSES = ("NoYawn", "Yawn")
@@ -49,7 +49,12 @@ SPLITS = ("train", "val", "test")
 BACKGROUND_VALUE = 0.0  # you can set 0.2, 0.5, etc. if you want gray background
 
 # Padding (in pixels) around the mouth+jaw rectangular ROI
-ROI_PADDING_PX = 11
+ROI_PADDING_PX = 10
+
+# Keep-aspect padding:
+# - bbox çok yataysa (box_w >> box_h) yatay pad'i (pad_x) otomatik kıs.
+# - dikey pad (pad_y) aynı kalır.
+ROI_KEEP_ASPECT_PAD_X_MIN_SCALE = 0.2
 
 
 mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
@@ -111,14 +116,30 @@ def create_mouth_jaw_mask(image_np: np.ndarray, face_landmarks) -> np.ndarray:
         # Fallback: empty mask
         return np.zeros((h, w), dtype=np.float32)
 
-    pad = int(ROI_PADDING_PX)
+    x_min = int(min(xs))
+    x_max = int(max(xs))
+    y_min = int(min(ys))
+    y_max = int(max(ys))
 
-    x0 = max(0, min(xs) - pad)
-    y0 = max(0, min(ys) - pad)
+    box_w = max(1, x_max - x_min)
+    box_h = max(1, y_max - y_min)
+
+    pad_base = int(ROI_PADDING_PX)
+
+    # bbox çok yatıksa pad_x küçülür; bbox dikey ise pad_x büyümez (cap=1.0).
+    min_x_scale = float(ROI_KEEP_ASPECT_PAD_X_MIN_SCALE)
+    auto_x_scale = float(box_h / box_w)
+    auto_x_scale = max(min_x_scale, min(1.0, auto_x_scale))
+
+    pad_x = int(round(pad_base * auto_x_scale))
+    pad_y = pad_base
+
+    x0 = max(0, x_min - pad_x)
+    y0 = max(0, y_min - pad_y)
 
     # end‑exclusive bounds for slicing
-    x1 = min(w, max(xs) + pad + 1)
-    y1 = min(h, max(ys) + pad + 1)
+    x1 = min(w, x_max + pad_x + 1)
+    y1 = min(h, y_max + pad_y + 1)
 
     # ensure at least 1px ROI
     if x1 <= x0:

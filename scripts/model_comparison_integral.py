@@ -29,6 +29,8 @@ CONFIG = {
     "landmark_box_half_size": 15,
     "background_mask_value": 0.2,   # 0.0 = hard mask, 0.2 = soft mask
     "roi_padding_px": 11,
+    # When bbox is wide, reduce horizontal padding (pad_x) relative to vertical padding (pad_y).
+    "roi_keep_aspect_pad_x_min_scale": 0.2,
 
     # Threshold rule
     "threshold_source": "baseline_median",
@@ -125,7 +127,7 @@ def create_landmark_mask(image_np_uint8, img_size):
     """
     h, w = img_size
     bg = float(CONFIG.get("background_mask_value", 0.0))
-    pad = int(CONFIG.get("roi_padding_px", 12))
+    pad_base = int(CONFIG.get("roi_padding_px", 12))
 
     results = mp_face_mesh.process(image_np_uint8)
     if not results.multi_face_landmarks:
@@ -149,12 +151,24 @@ def create_landmark_mask(image_np_uint8, img_size):
     if not xs:
         return None
 
-    x0 = max(0, min(xs) - pad)
-    y0 = max(0, min(ys) - pad)
+    x_min, x_max = int(min(xs)), int(max(xs))
+    y_min, y_max = int(min(ys)), int(max(ys))
+    box_w = max(1, x_max - x_min)
+    box_h = max(1, y_max - y_min)
+
+    min_x_scale = float(CONFIG.get("roi_keep_aspect_pad_x_min_scale", 0.2))
+    auto_x_scale = float(box_h / box_w)
+    auto_x_scale = max(min_x_scale, min(1.0, auto_x_scale))
+
+    pad_x = int(round(pad_base * auto_x_scale))
+    pad_y = pad_base
+
+    x0 = max(0, x_min - pad_x)
+    y0 = max(0, y_min - pad_y)
 
     # IMPORTANT: end-exclusive for slicing
-    x1 = min(w, max(xs) + pad + 1)
-    y1 = min(h, max(ys) + pad + 1)
+    x1 = min(w, x_max + pad_x + 1)
+    y1 = min(h, y_max + pad_y + 1)
 
     # ensure at least 1px ROI
     if x1 <= x0:
@@ -596,7 +610,7 @@ if __name__ == "__main__":
 
 
     # 4) Plot histograms (optional but useful)
-    hist_path = os.path.join("artifacts", f"model_focus_comparison_mouth-jaw-9_{dataset_name}.png")
+    hist_path = os.path.join("artifacts", f"model_focus_comparison_mouth-jaw-{cfg['roi_padding_px']}_{dataset_name}.png")
     plot_focus_ratio_by_model(ratios_by_model, dataset_name, hist_path)
     #plot_histograms(ratios_by_model, dataset_name, hist_path)
 
