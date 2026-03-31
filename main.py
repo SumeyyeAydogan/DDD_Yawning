@@ -38,26 +38,11 @@ if __name__ == "__main__":
     
     # 4) EXPERIMENT CONFIGURATION
     # ============================================================
-    # Test Strategy Options:
-    # 1. Adversarial Augmentation ONLY (recommended first test)
-    #    - USE_SAMPLE_WEIGHT=False, USE_ADVERSARIAL_AUG=True
-    # 2. Sample Weight ONLY (current baseline)
-    #    - USE_SAMPLE_WEIGHT=True, USE_ADVERSARIAL_AUG=False
-    # 3. BOTH (hybrid approach - test after individual tests)
-    #    - USE_SAMPLE_WEIGHT=True, USE_ADVERSARIAL_AUG=True
-    # ============================================================
-   
-    USE_ADVERSARIAL_AUG = False  # Set to True to enable adversarial augmentation
     GRADCAM_WEIGHTS_FILE = os.path.join(project_root, "artifacts", "reward-landmark-soft","exp_weights.json")
     #exp_weights optimized_gradcam_weights
     
     # Create run name based on configuration
-    run_name_parts = []
-    if USE_ADVERSARIAL_AUG:
-        run_name_parts.append("adv-aug")  # adversarial augmentation
-    if not run_name_parts:
-        run_name_parts.append("exp-reward-soft-sw-yawning") #run_name_parts.append("baseline") exp-scale-sw-gradcam-reward-gs-eye-mouth-soft-mask
-    run_name = "30_epoch_" + "_".join(run_name_parts)
+    run_name = "30_epoch_exp-reward-soft-sw-yawning"
     
     # 5) Create run manager
     print("📁 Creating run manager...")
@@ -75,10 +60,6 @@ if __name__ == "__main__":
         img_size=(224, 224),
         batch_size=32,
         seed=42,
-        # Adversarial augmentation configuration
-        use_background_aug=USE_ADVERSARIAL_AUG,  # Enable adversarial background augmentation
-        bg_aug_prob=0.4 if USE_ADVERSARIAL_AUG else 0.0,  # Probability of applying augmentation
-        bg_aug_face_ratio=0.75 if USE_ADVERSARIAL_AUG else 0.75,  # Face region ratio
         gradcam_weights_path=GRADCAM_WEIGHTS_FILE
     )
     
@@ -86,10 +67,6 @@ if __name__ == "__main__":
     print("\n" + "=" * 50)
     print("📋 EXPERIMENT CONFIGURATION:")
     print("=" * 50)
-    print(f"  ✅ Adversarial Aug:       {USE_ADVERSARIAL_AUG}")
-    if USE_ADVERSARIAL_AUG:
-        print(f"     - Augmentation Prob:  0.4")
-        print(f"     - Face Region Ratio:  0.4")
     print("=" * 50 + "\n")
     
     print("✅ Datasets loaded successfully!")
@@ -138,7 +115,7 @@ if __name__ == "__main__":
         "model_type": "CNN",
         "classes": list(class_names),
         "batch_size": 32,
-        "learning_rate": 1e-4,
+        "learning_rate": 1e-3,
         "started_at": str(datetime.now()),
         "initial_epoch": initial_epoch
     }

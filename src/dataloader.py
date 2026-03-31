@@ -3,7 +3,6 @@ import os
 
 import numpy as np
 import tensorflow as tf
-from src.simple_mask import create_simple_mask_generator
 
 
 def get_binary_pipelines(
@@ -12,9 +11,6 @@ def get_binary_pipelines(
     batch_size=16,
     seed=42,
     class_names=("NoYawn", "Yawn"),
-    use_background_aug=False,  # Adversarial background augmentation
-    bg_aug_prob=0.4,           # Probability of applying background augmentation
-    bg_aug_face_ratio=0.75,    # Face region ratio (center of image)
     gradcam_weights_path=None,
     gradcam_weight_scale=1.0,  # Don't scale - weights already optimized by auto_optimize script 04 for exp
     gradcam_weight_clip=(0.1, 6.9),  # Match optimized clip range from gradcam_opt_params.json 0.76, 1.24 (0.1, 3.4
@@ -85,19 +81,7 @@ def get_binary_pipelines(
         num_parallel_calls=AUTOTUNE,
     )
 
-    # 4.5) Adversarial background augmentation (train only)
-    if use_background_aug:
-        from src.adversarial_augmentation import RandomBackgroundReplacement
-
-        bg_aug_layer = RandomBackgroundReplacement(
-            prob=bg_aug_prob, face_center_ratio=bg_aug_face_ratio
-        )
-        train_ds = train_ds.map(
-            lambda x, y: (bg_aug_layer(x, training=True), y),
-            num_parallel_calls=AUTOTUNE,
-        )
-
-    # 4.6) Clean possible decode/augment errors for train
+    # 4.5) Clean possible decode/augment errors for train
     # (It is important to do this BEFORE adding weights)
     train_ds = train_ds.apply(tf.data.experimental.ignore_errors())
 
