@@ -25,7 +25,7 @@ def train_model(model, train_ds, val_ds, epochs=10, callbacks=None, initial_epoc
         metrics=['accuracy'],  # Keep basic accuracy unweighted
         weighted_metrics=[Precision(name='precision'), Recall(name='recall'), AUC(name='auc')],  # These will use sample_weight
         #metrics=['accuracy', Precision(name='precision'), Recall(name='recall'), AUC(name='auc')]
-        #run_eagerly=True
+        #run_eagerly=True it was releated to sample_weight but we don't need it anymore thanks to graph-safe solution
     )
     
     # Prepare callbacks
