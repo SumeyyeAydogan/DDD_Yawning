@@ -45,8 +45,8 @@ class SimpleMaskedLoss(tf.keras.losses.Loss):
     ):
         ce = self.call(y_true, y_pred, **kwargs)  # (batch, 1) or (batch,)
 
-        # Squeeze → (batch,)
-        if tf.rank(ce) > 1:
+        # Squeeze → (batch,) when we statically know there is an extra dim
+        if ce.shape.rank is not None and ce.shape.rank > 1:
             ce = tf.squeeze(ce, axis=-1)
         ce = tf.cast(ce, tf.float32)
 
