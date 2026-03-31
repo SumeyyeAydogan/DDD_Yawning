@@ -23,6 +23,7 @@ from statistics import median
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw
 import mediapipe as mp
+import argparse
 
 # Add root path
 project_root = Path(__file__).parent.parent
@@ -33,13 +34,13 @@ from src.gradcam import CustomGradCAM
 
 # ================== CONFIG ======================
 CONFIG = {
-    #"model_path": r"runs/30_epoch_baseline_e3_yawning/models/final_model.h5",
     "model_path": r"runs/30_epoch_baseline_e3_yawning/models/final_model.h5",
     "data_dir": r"ydd_splitted_dataset/train",
     "img_size": (224, 224),
-    "use_landmark_mask": True,  # Use dynamic landmark mask instead of static mask
-    #"landmark_box_half_size": 16,  # Half side-length of square patches around landmarks
     "roi_padding_px": 9,          # Padding around the mouth+jaw bounding box (in pixels)
+    # When bbox is wide, reduce horizontal padding (pad_x) relative to vertical padding (pad_y).
+    # This helps avoid including too much irrelevant horizontal background.
+    "roi_keep_aspect_pad_x_min_scale": 0.2,
     "fallback_to_static": True,     # If landmark detection fails, use static mask
     "background_mask_value": 0.2,  # Background value for non-ROI regions (0.0 = hard mask, 0.2 = soft mask)
     "search_level": 2,        # (2 = ORTA)
@@ -86,7 +87,7 @@ def create_landmark_mask(image_np_uint8, img_size):
     """
     h, w = img_size
     bg = float(CONFIG.get("background_mask_value", 0.0))
-    pad = int(CONFIG.get("roi_padding_px", 12))
+    pad_base = int(CONFIG.get("roi_padding_px", 12))
 
     results = mp_face_mesh.process(image_np_uint8)
     if not results.multi_face_landmarks:
@@ -110,12 +111,25 @@ def create_landmark_mask(image_np_uint8, img_size):
     if not xs:
         return None
 
-    x0 = max(0, min(xs) - pad)
-    y0 = max(0, min(ys) - pad)
+    x_min, x_max = int(min(xs)), int(max(xs))
+    y_min, y_max = int(min(ys)), int(max(ys))
+    box_w = max(1, x_max - x_min)
+    box_h = max(1, y_max - y_min)
+
+    # bbox çok yatıksa pad_x otomatik küçülür
+    min_x_scale = float(CONFIG.get("roi_keep_aspect_pad_x_min_scale", 0.2))
+    auto_x_scale = float(box_h / box_w)
+    auto_x_scale = max(min_x_scale, min(1.0, auto_x_scale))
+
+    pad_x = int(round(pad_base * auto_x_scale))
+    pad_y = pad_base
+
+    x0 = max(0, x_min - pad_x)
+    y0 = max(0, y_min - pad_y)
 
     # IMPORTANT: end-exclusive for slicing
-    x1 = min(w, max(xs) + pad + 1)
-    y1 = min(h, max(ys) + pad + 1)
+    x1 = min(w, x_max + pad_x + 1)
+    y1 = min(h, y_max + pad_y + 1)
 
     # ensure at least 1px ROI
     if x1 <= x0:
@@ -203,10 +217,9 @@ def collect_focus_distribution(model, data_dir, img_size):
     static_fallback_count = 0
 
     print("[AutoOpt] Computing focus distribution...")
-    print(f"[AutoOpt] Using {'landmark mask' if CONFIG['use_landmark_mask'] else 'static mask'}")
-    if CONFIG['use_landmark_mask']:
-        print(f"[AutoOpt] Landmark roi-padding: {CONFIG['roi_padding_px']}")
-        print(f"[AutoOpt] Fallback to static: {CONFIG['fallback_to_static']}")
+    print("[AutoOpt] Using landmark mask with fallback to static (if enabled).")
+    print(f"[AutoOpt] Landmark roi-padding: {CONFIG['roi_padding_px']}")
+    print(f"[AutoOpt] Fallback to static: {CONFIG['fallback_to_static']}")
 
     for idx, (data_batch, path_batch) in enumerate(ds):
         images, labels = data_batch
@@ -228,23 +241,17 @@ def collect_focus_distribution(model, data_dir, img_size):
             antialias=True      # Anti-aliasing for smoother resize
         ).numpy()[..., 0]
 
-        # Create dynamic landmark mask for this image
-        if CONFIG['use_landmark_mask']:
-            mask = create_landmark_mask(image_uint8, img_size)
-            if mask is None:
-                # Landmark detection failed - use fallback
-                if CONFIG['fallback_to_static']:
-                    mask = create_static_mask_fallback(img_size)
-                    static_fallback_count += 1
-                else:
-                    # Skip this image if no fallback
-                    print(f"[WARN] No face detected in image {idx+1}, skipping...")
-                    continue
+        # Create dynamic landmark mask for this image (always try landmark; optional static fallback)
+        mask = create_landmark_mask(image_uint8, img_size)
+        if mask is None:
+            if CONFIG['fallback_to_static']:
+                mask = create_static_mask_fallback(img_size)
+                static_fallback_count += 1
             else:
-                landmark_success_count += 1
+                print(f"[WARN] No face detected in image {idx+1}, skipping...")
+                continue
         else:
-            # Use static mask
-            mask = create_static_mask_fallback(img_size)
+            landmark_success_count += 1
 
         ratio = compute_focus_ratio(heatmap, mask)
         ratios.append(ratio)
@@ -524,7 +531,43 @@ Parameters:
 
 # ================== MAIN ======================
 if __name__ == "__main__":
-    cfg = CONFIG
+    parser = argparse.ArgumentParser(
+        description="Auto-optimize GradCAM sample weights and write artifacts."
+    )
+    parser.add_argument("--model-path", default=CONFIG.get("model_path"))
+    parser.add_argument("--data-dir", default=CONFIG.get("data_dir"))
+    parser.add_argument("--img-size", default="224,224", help="H,W (e.g. 224,224)")
+    parser.add_argument("--search-level", type=int, default=int(CONFIG.get("search_level", 2)))
+    parser.add_argument("--weight-mode", choices=["reward", "penalize"], default=CONFIG.get("weight_mode", "reward"))
+    parser.add_argument("--roi-padding-px", type=int, default=int(CONFIG.get("roi_padding_px", 12)))
+    parser.add_argument("--background-mask-value", type=float, default=float(CONFIG.get("background_mask_value", 0.0)))
+    parser.add_argument("--fallback-to-static", type=int, default=1 if CONFIG.get("fallback_to_static", True) else 0)
+    parser.add_argument(
+        "--artifacts-dir",
+        default="artifacts",
+        help="Directory to write outputs (optimized_gradcam_weights.json, gradcam_opt_params.json, report, histogram).",
+    )
+
+    args = parser.parse_args()
+
+    h_w = [int(x.strip()) for x in str(args.img_size).split(",") if x.strip()]
+    if len(h_w) != 2:
+        raise SystemExit("--img-size must be like 224,224")
+
+    cfg = dict(CONFIG)
+    cfg["model_path"] = args.model_path
+    cfg["data_dir"] = args.data_dir
+    cfg["img_size"] = (h_w[0], h_w[1])
+    cfg["search_level"] = args.search_level
+    cfg["weight_mode"] = args.weight_mode
+    cfg["roi_padding_px"] = args.roi_padding_px
+    cfg["background_mask_value"] = args.background_mask_value
+    cfg["fallback_to_static"] = bool(args.fallback_to_static)
+
+    CONFIG.update(cfg)
+
+    artifacts_dir = args.artifacts_dir
+    os.makedirs(artifacts_dir, exist_ok=True)
 
     model = tf.keras.models.load_model(cfg["model_path"], compile=False)
 
@@ -536,31 +579,30 @@ if __name__ == "__main__":
                                        if k not in ['mean_focus', 'median_focus', 'std_focus', 'q25_focus', 'q75_focus']})
 
     # SAVE PARAMS
-    os.makedirs("artifacts", exist_ok=True)
-    with open("artifacts/gradcam_opt_params.json", "w") as f:
+    with open(os.path.join(artifacts_dir, "gradcam_opt_params.json"), "w") as f:
         json.dump(params, f, indent=2)
 
     # APPLY & SAVE
     weights, weight_values, weight_stats = apply_weights(
         params, ratios, file_paths,
-        output_path="artifacts/optimized_gradcam_weights.json")
+        output_path=os.path.join(artifacts_dir, "optimized_gradcam_weights.json"))
 
     # IMPROVEMENT: Create histogram
     plot_weight_histogram(
         weight_values, ratios, params,
-        output_path="artifacts/gradcam_weight_histogram.png"
+        output_path=os.path.join(artifacts_dir, "gradcam_weight_histogram.png")
     )
 
     # IMPROVEMENT: Enhanced report
-    with open("artifacts/gradcam_opt_report.txt", "w") as f:
+    with open(os.path.join(artifacts_dir, "gradcam_opt_report.txt"), "w", encoding="utf-8") as f:
         f.write("=== GradCAM Optimization Report (IMPROVED) ===\n\n")
         f.write("Weight Mode:\n")
         mode = cfg.get("weight_mode", "reward")
         f.write(f"  Mode: {mode}\n")
         if mode == "reward":
-            f.write("  Strategy: High focus ratio → High weight (reward good ROI focus)\n")
+            f.write("  Strategy: High focus ratio -> High weight (reward good ROI focus)\n")
         else:
-            f.write("  Strategy: Low focus ratio → High weight (penalize bad ROI focus)\n")
+            f.write("  Strategy: Low focus ratio -> High weight (penalize bad ROI focus)\n")
         f.write("\nFocus Ratio Statistics:\n")
         f.write(f"  Mean: {params.get('mean_focus', np.mean(ratios)):.3f}\n")
         f.write(f"  Median: {params.get('median_focus', median(ratios)):.3f}\n")
@@ -576,11 +618,9 @@ if __name__ == "__main__":
             f.write(f"  {key.capitalize()}: {value:.3f}\n")
         f.write(f"\nTotal Samples: {len(ratios)}\n")
         f.write(f"\nMask Configuration:\n")
-        f.write(f"  Use Landmark Mask: {cfg['use_landmark_mask']}\n")
         f.write(f"  Background Mask Value: {cfg.get('background_mask_value', 0.0):.2f}\n")
-        if cfg['use_landmark_mask']:
-            f.write(f"  Landmark Box Half-Size: {cfg['roi_padding_px']}\n")
-            f.write(f"  Fallback to Static: {cfg['fallback_to_static']}\n")
+        f.write(f"  ROI Padding (mouth+jaw): {cfg['roi_padding_px']}\n")
+        f.write(f"  Fallback to Static: {cfg['fallback_to_static']}\n")
         f.write(f"\nWeight Optimization Configuration:\n")
         f.write(f"  Alpha Range: [{cfg.get('alpha_min', 0.3):.2f}, {cfg.get('alpha_max', 3.0):.2f}]\n")
         f.write(f"  Clip Range Factor: {cfg.get('clip_range_factor', 0.8):.2f}\n")
@@ -591,7 +631,7 @@ if __name__ == "__main__":
         f.write(f"  Score = std(weights) - lambda_clip * frac_clipped - lambda_mean * |mean(weights) - 1|\n")
         f.write(f"  Higher score = better separation with balanced distribution\n")
 
-    print("\n[AutoOpt] DONE. Files saved in /artifacts")
+    print(f"\n[AutoOpt] DONE. Files saved in: {artifacts_dir}")
     print("  - optimized_gradcam_weights.json")
     print("  - gradcam_opt_params.json")
     print("  - gradcam_opt_report.txt")
