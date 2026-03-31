@@ -1,4 +1,7 @@
-
+"""
+Simple mask generation alternative implementation.
+Compatible with TensorFlow graph mode, less complex.
+"""
 import tensorflow as tf
 import numpy as np
 from typing import Tuple, Optional

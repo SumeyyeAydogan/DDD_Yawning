@@ -63,6 +63,8 @@ if __name__ == "__main__":
     print("📁 Creating run manager...")
     run_manager = RunManager(run_name)
     print(f"✅ Run manager created: {run_manager.run_dir}")
+    print(tf.__version__); print(tf.config.list_physical_devices('GPU'))
+
 
     # 6) tf.data pipelines
     # LOADER (binary: NotDrowsy=0, Drowsy=1)
@@ -77,7 +79,7 @@ if __name__ == "__main__":
         use_background_aug=USE_ADVERSARIAL_AUG,  # Enable adversarial background augmentation
         bg_aug_prob=0.4 if USE_ADVERSARIAL_AUG else 0.0,  # Probability of applying augmentation
         bg_aug_face_ratio=0.75 if USE_ADVERSARIAL_AUG else 0.75,  # Face region ratio
-        #gradcam_weights_path=GRADCAM_WEIGHTS_FILE
+        gradcam_weights_path=GRADCAM_WEIGHTS_FILE
     )
     
     # Print configuration

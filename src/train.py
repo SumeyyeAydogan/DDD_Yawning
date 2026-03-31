@@ -21,10 +21,10 @@ def train_model(model, train_ds, val_ds, epochs=10, callbacks=None, initial_epoc
     # Compile model
     model.compile(
         optimizer=tf.keras.optimizers.Adam(1e-3),
-        loss='binary_crossentropy', #loss_fn, 'binary_crossentropy'
-        #metrics=['accuracy'],  # Keep basic accuracy unweighted
-        #weighted_metrics=[Precision(name='precision'), Recall(name='recall'), AUC(name='auc')],  # These will use sample_weight
-        metrics=['accuracy', Precision(name='precision'), Recall(name='recall'), AUC(name='auc')]
+        loss=loss_fn, #loss_fn, 'binary_crossentropy'
+        metrics=['accuracy'],  # Keep basic accuracy unweighted
+        weighted_metrics=[Precision(name='precision'), Recall(name='recall'), AUC(name='auc')],  # These will use sample_weight
+        #metrics=['accuracy', Precision(name='precision'), Recall(name='recall'), AUC(name='auc')]
         #run_eagerly=True
     )
     
@@ -43,7 +43,7 @@ def train_model(model, train_ds, val_ds, epochs=10, callbacks=None, initial_epoc
         epochs=epochs,
         initial_epoch=initial_epoch,
         callbacks=callbacks,
-        #verbose=1
+        verbose=1
     )
     
     '''

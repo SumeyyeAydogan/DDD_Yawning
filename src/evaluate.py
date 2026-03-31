@@ -37,6 +37,14 @@ def evaluate_model(
 
         preds = model.predict(x_batch, verbose=0)
         
+        # Check for NaN or Inf in predictions
+        if np.any(np.isnan(preds)) or np.any(np.isinf(preds)):
+            print(f"⚠️ WARNING: NaN or Inf detected in model predictions!")
+            print(f"   NaN count: {np.sum(np.isnan(preds))}, Inf count: {np.sum(np.isinf(preds))}")
+            # Clip invalid values to valid range [0, 1]
+            preds = np.nan_to_num(preds, nan=0.5, posinf=1.0, neginf=0.0)
+            preds = np.clip(preds, 0.0, 1.0)
+        
         # For binary classification: y_batch is already 0 or 1
         y_true.extend(y_batch.numpy().flatten())
         y_pred.extend((preds > 0.5).astype(int).flatten())  # Threshold 0.5
@@ -47,7 +55,38 @@ def evaluate_model(
     y_pred = np.array(y_pred)
     y_pred_proba = np.array(y_pred_proba)
     
-    roc_auc = roc_auc_score(y_true, y_pred_proba)
+    # Final validation: check for NaN/Inf in collected arrays
+    nan_mask = np.isnan(y_pred_proba) | np.isinf(y_pred_proba)
+    if np.any(nan_mask):
+        print(f"⚠️ WARNING: Found {np.sum(nan_mask)} NaN/Inf values in predictions after collection")
+        print(f"   Removing invalid predictions for evaluation...")
+        valid_mask = ~nan_mask
+        y_true = y_true[valid_mask]
+        y_pred = y_pred[valid_mask]
+        y_pred_proba = y_pred_proba[valid_mask]
+        # Replace any remaining invalid values
+        y_pred_proba = np.nan_to_num(y_pred_proba, nan=0.5, posinf=1.0, neginf=0.0)
+        y_pred_proba = np.clip(y_pred_proba, 0.0, 1.0)
+    
+    # Check if we have enough samples and both classes
+    if len(y_true) == 0:
+        raise ValueError("No valid predictions collected! Check your dataset and model.")
+    
+    unique_classes = np.unique(y_true)
+    if len(unique_classes) < 2:
+        print(f"⚠️ WARNING: Only one class found in labels: {unique_classes}")
+        print(f"   Cannot compute ROC AUC. Using default value 0.5")
+        roc_auc = 0.5
+    else:
+        try:
+            roc_auc = roc_auc_score(y_true, y_pred_proba)
+            if np.isnan(roc_auc) or np.isinf(roc_auc):
+                print(f"⚠️ WARNING: ROC AUC is NaN/Inf. Using default value 0.5")
+                roc_auc = 0.5
+        except ValueError as e:
+            print(f"⚠️ WARNING: Error computing ROC AUC: {e}")
+            print(f"   Using default value 0.5")
+            roc_auc = 0.5
 
     # 2) Print classification report
     print("Classification Report:")
