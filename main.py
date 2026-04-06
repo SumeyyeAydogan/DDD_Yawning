@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+import argparse
 import tensorflow as tf
 
 from src.split_dataset   import split_dataset
@@ -11,11 +12,21 @@ from src.evaluate        import evaluate_model
 from src.gradcam_analysis import analyze_tf_keras_gradcam
 from src.run_manager     import RunManager
 from src.callbacks       import get_training_callbacks
+from src.cross_validation import cross_validate_model
 import splitfolders
 
 if __name__ == "__main__":
     print("?? Starting Drowsy Driver Detection Project...")
     print("=" * 50)
+    
+    # CLI args
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--use_cv", action="store_true", help="Run k-fold cross-validation before standard training")
+    parser.add_argument("--cv_folds", type=int, default=5, help="Number of folds for cross-validation")
+    parser.add_argument("--cv_epochs", type=int, default=30, help="Number of epochs per fold during cross-validation")
+    parser.add_argument("--cv_base_dir", type=str, default="ydd_splitted_dataset_cv",
+                        help="Base directory for CV dataset (e.g. ydd_splitted_dataset_cv)")
+    args = parser.parse_args()
     
     # Project root directory: the folder where this file is located
     import os
@@ -27,7 +38,7 @@ if __name__ == "__main__":
     if not os.path.exists(raw_dir):
         raise FileNotFoundError(f"`dataset` not found: {raw_dir}")
 
-    # 2) Folder where split data will go
+    # 2) Folder where split data will go (main training)
     output_dir = os.path.join(project_root, "ydd_splitted_dataset")
     print(f"?? Data directory: {output_dir}")
 
@@ -50,6 +61,33 @@ if __name__ == "__main__":
     print(f"✅ Run manager created: {run_manager.run_dir}")
     print(tf.__version__); print(tf.config.list_physical_devices('GPU'))
 
+    # Optional: run k-fold cross-validation on a (possibly different) train split
+    if args.use_cv:
+        cv_base_dir = os.path.join(project_root, args.cv_base_dir)
+        print(f"?? CV data directory: {cv_base_dir}")
+        print("?? Running cross-validation...")
+        cv_results = cross_validate_model(
+            base_dir=cv_base_dir,
+            k=args.cv_folds,
+            img_size=(224, 224),
+            batch_size=32,
+            epochs=args.cv_epochs,
+            class_names=("NoYawn", "Yawn"),
+        )
+        print(f"CV results: {cv_results}")
+
+        # Save a simple text summary under the current run directory
+        cv_summary_path = os.path.join(run_manager.run_dir, "cv_summary.txt")
+        with open(cv_summary_path, "w", encoding="utf-8") as f:
+            f.write("Cross-validation summary\n")
+            f.write(f"Folds       : {args.cv_folds}\n")
+            f.write(f"Epochs/fold : {args.cv_epochs}\n")
+            f.write(f"Base dir    : {cv_base_dir}\n\n")
+            f.write(f"val_accuracy_mean = {cv_results.get('val_accuracy_mean', float('nan')):.4f}\n")
+            f.write(f"val_accuracy_std  = {cv_results.get('val_accuracy_std', float('nan')):.4f}\n")
+            f.write(f"val_auc_mean      = {cv_results.get('val_auc_mean', float('nan')):.4f}\n")
+            f.write(f"val_auc_std       = {cv_results.get('val_auc_std', float('nan')):.4f}\n")
+        print(f"?? CV summary saved to: {cv_summary_path}")
 
     # 6) tf.data pipelines
     # LOADER (binary: NotDrowsy=0, Drowsy=1)
