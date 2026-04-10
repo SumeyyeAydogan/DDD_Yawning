@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -44,6 +45,7 @@ def _make_tf_dataset_from_paths(
     img_size: Tuple[int, int],
     batch_size: int,
     augment: bool,
+    sample_weights: np.ndarray = None,
 ) -> tf.data.Dataset:
     """
     Build a tf.data.Dataset from lists of paths and labels.
@@ -53,7 +55,19 @@ def _make_tf_dataset_from_paths(
 
     paths_ds = tf.data.Dataset.from_tensor_slices(file_paths)
     labels_ds = tf.data.Dataset.from_tensor_slices(labels)
-    ds = tf.data.Dataset.zip((paths_ds, labels_ds))
+
+    if sample_weights is not None:
+        weights_ds = tf.data.Dataset.from_tensor_slices(sample_weights.astype(np.float32))
+        ds = tf.data.Dataset.zip((paths_ds, labels_ds, weights_ds))
+    else:
+        ds = tf.data.Dataset.zip((paths_ds, labels_ds))
+
+    def _load_and_preprocess_with_weights(path, label, weight):
+        img_bytes = tf.io.read_file(path)
+        img = tf.image.decode_image(img_bytes, channels=3, expand_animations=False)
+        img = tf.image.resize(img, img_size)
+        img = tf.cast(img, tf.float32) / 255.0
+        return img, tf.expand_dims(label, axis=-1), tf.cast(weight, tf.float32)
 
     def _load_and_preprocess(path, label):
         img_bytes = tf.io.read_file(path)
@@ -62,7 +76,10 @@ def _make_tf_dataset_from_paths(
         img = tf.cast(img, tf.float32) / 255.0
         return img, tf.expand_dims(label, axis=-1)
 
-    ds = ds.map(_load_and_preprocess, num_parallel_calls=AUTOTUNE)
+    if sample_weights is not None:
+        ds = ds.map(_load_and_preprocess_with_weights, num_parallel_calls=AUTOTUNE)
+    else:
+        ds = ds.map(_load_and_preprocess, num_parallel_calls=AUTOTUNE)
 
     if augment:
         aug = tf.keras.Sequential(
@@ -74,10 +91,16 @@ def _make_tf_dataset_from_paths(
             ]
         )
 
-        def _apply_augment(x, y):
-            return aug(x, training=True), y
+        if sample_weights is not None:
+            def _apply_augment_with_weights(x, y, w):
+                return aug(x, training=True), y, w
 
-        ds = ds.map(_apply_augment, num_parallel_calls=AUTOTUNE)
+            ds = ds.map(_apply_augment_with_weights, num_parallel_calls=AUTOTUNE)
+        else:
+            def _apply_augment(x, y):
+                return aug(x, training=True), y
+
+            ds = ds.map(_apply_augment, num_parallel_calls=AUTOTUNE)
 
     if augment:
         ds = ds.shuffle(1000, reshuffle_each_iteration=True)
@@ -94,6 +117,7 @@ def cross_validate_model(
     seed: int = 42,
     epochs: int = 30,
     class_names: Tuple[str, str] = ("NoYawn", "Yawn"),
+    sample_weights_path: str = None,
 ) -> Dict[str, float]:
     """
     Simple k-fold cross-validation over base_dir/train.
@@ -118,6 +142,15 @@ def cross_validate_model(
     rng.shuffle(indices)
     folds = np.array_split(indices, k)
 
+    # Optional global precomputed sample weights (rel_path -> weight)
+    global_weights_by_path = None
+    if sample_weights_path:
+        if not os.path.exists(sample_weights_path):
+            raise FileNotFoundError(f"Sample weights file not found: {sample_weights_path}")
+        with open(sample_weights_path, "r", encoding="utf-8") as f:
+            global_weights_by_path = json.load(f)
+        print(f"[CV] Loaded global sample weights from: {sample_weights_path}")
+
     val_acc_per_fold: List[float] = []
     val_auc_per_fold: List[float] = []
 
@@ -130,8 +163,24 @@ def cross_validate_model(
         train_labels = labels[train_idx]
         val_labels = labels[val_idx]
 
+        train_sample_weights = None
+        if global_weights_by_path is not None:
+            train_root = os.path.join(base_dir, "train")
+            train_sample_weights = np.array(
+                [
+                    float(global_weights_by_path.get(os.path.relpath(fp, train_root).replace("\\", "/"), 1.0))
+                    for fp in train_files
+                ],
+                dtype=np.float32,
+            )
+
         train_ds = _make_tf_dataset_from_paths(
-            train_files, train_labels, img_size, batch_size, augment=True
+            train_files,
+            train_labels,
+            img_size,
+            batch_size,
+            augment=True,
+            sample_weights=train_sample_weights,
         )
         val_ds = _make_tf_dataset_from_paths(
             val_files, val_labels, img_size, batch_size, augment=False

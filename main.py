@@ -21,11 +21,13 @@ if __name__ == "__main__":
     
     # CLI args
     parser = argparse.ArgumentParser()
-    parser.add_argument("--use_cv", action="store_true", help="Run k-fold cross-validation before standard training")
+    parser.add_argument("--use_cv", action="store_true", default=True, help="Run k-fold cross-validation before standard training")
     parser.add_argument("--cv_folds", type=int, default=5, help="Number of folds for cross-validation")
     parser.add_argument("--cv_epochs", type=int, default=30, help="Number of epochs per fold during cross-validation")
     parser.add_argument("--cv_base_dir", type=str, default="ydd_splitted_dataset_cv",
                         help="Base directory for CV dataset (e.g. ydd_splitted_dataset_cv)")
+    parser.add_argument("--cv_weights_path", type=str, default="artifacts/reward-landmark-soft/exp_weights.json",
+                        help="Optional global precomputed sample-weights JSON path for CV (relative to project root or absolute)")
     args = parser.parse_args()
     
     # Project root directory: the folder where this file is located
@@ -66,6 +68,14 @@ if __name__ == "__main__":
         cv_base_dir = os.path.join(project_root, args.cv_base_dir)
         print(f"?? CV data directory: {cv_base_dir}")
         print("?? Running cross-validation...")
+        cv_weights_path = None
+        if args.cv_weights_path:
+            cv_weights_path = (
+                args.cv_weights_path
+                if os.path.isabs(args.cv_weights_path)
+                else os.path.join(project_root, args.cv_weights_path)
+            )
+            print(f"?? CV weights file: {cv_weights_path}")
         cv_results = cross_validate_model(
             base_dir=cv_base_dir,
             k=args.cv_folds,
@@ -73,16 +83,19 @@ if __name__ == "__main__":
             batch_size=32,
             epochs=args.cv_epochs,
             class_names=("NoYawn", "Yawn"),
+            sample_weights_path=cv_weights_path,
         )
         print(f"CV results: {cv_results}")
 
         # Save a simple text summary under the current run directory
         cv_summary_path = os.path.join(run_manager.run_dir, "cv_summary.txt")
+        os.makedirs(os.path.dirname(cv_summary_path), exist_ok=True)
         with open(cv_summary_path, "w", encoding="utf-8") as f:
             f.write("Cross-validation summary\n")
             f.write(f"Folds       : {args.cv_folds}\n")
             f.write(f"Epochs/fold : {args.cv_epochs}\n")
             f.write(f"Base dir    : {cv_base_dir}\n\n")
+            f.write(f"Weights file: {cv_weights_path if cv_weights_path else 'None'}\n\n")
             f.write(f"val_accuracy_mean = {cv_results.get('val_accuracy_mean', float('nan')):.4f}\n")
             f.write(f"val_accuracy_std  = {cv_results.get('val_accuracy_std', float('nan')):.4f}\n")
             f.write(f"val_auc_mean      = {cv_results.get('val_auc_mean', float('nan')):.4f}\n")
