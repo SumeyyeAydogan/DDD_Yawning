@@ -118,6 +118,7 @@ def cross_validate_model(
     epochs: int = 30,
     class_names: Tuple[str, str] = ("NoYawn", "Yawn"),
     sample_weights_path: str = None,
+    run_dir: str = None,
 ) -> Dict[str, float]:
     """
     Simple k-fold cross-validation over base_dir/train.
@@ -153,6 +154,22 @@ def cross_validate_model(
 
     val_acc_per_fold: List[float] = []
     val_auc_per_fold: List[float] = []
+
+    # Always save fold artifacts when run_dir is provided.
+    fold_models_dir = None
+    fold_logs_dir = None
+    fold_metrics_path = None
+    weight_tag = "no_weights"
+    if sample_weights_path:
+        weight_tag = os.path.splitext(os.path.basename(sample_weights_path))[0]
+    if run_dir:
+        fold_models_dir = os.path.join(run_dir, "cv_models", weight_tag)
+        fold_logs_dir = os.path.join(run_dir, "cv_logs", weight_tag)
+        os.makedirs(fold_models_dir, exist_ok=True)
+        os.makedirs(fold_logs_dir, exist_ok=True)
+        fold_metrics_path = os.path.join(fold_logs_dir, "cv_fold_metrics.jsonl")
+        print(f"[CV] Fold models will be saved to: {fold_models_dir}")
+        print(f"[CV] Fold logs will be saved to: {fold_logs_dir}")
 
     for fold_idx in range(k):
         val_idx = folds[fold_idx]
@@ -211,6 +228,29 @@ def cross_validate_model(
         if val_auc is not None:
             val_auc_per_fold.append(float(val_auc))
 
+        # Save fold model + val file list for follow-up focus analysis
+        if run_dir:
+            fold_id = fold_idx + 1
+            model_path = os.path.join(fold_models_dir, f"fold_{fold_id}.h5")
+            model.save(model_path)
+
+            val_manifest_path = os.path.join(fold_logs_dir, f"fold_{fold_id}_val_files.txt")
+            with open(val_manifest_path, "w", encoding="utf-8") as mf:
+                for p in val_files:
+                    mf.write(f"{p}\n")
+
+            metric_row = {
+                "fold": fold_id,
+                "weight_tag": weight_tag,
+                "model_path": model_path,
+                "val_manifest_path": val_manifest_path,
+                "val_size": int(len(val_files)),
+                "val_accuracy": float(val_acc) if val_acc is not None else None,
+                "val_auc": float(val_auc) if val_auc is not None else None,
+            }
+            with open(fold_metrics_path, "a", encoding="utf-8") as ff:
+                ff.write(json.dumps(metric_row, ensure_ascii=False) + "\n")
+
     acc_mean = float(np.mean(val_acc_per_fold)) if val_acc_per_fold else float("nan")
     acc_std = float(np.std(val_acc_per_fold)) if val_acc_per_fold else float("nan")
     auc_mean = float(np.mean(val_auc_per_fold)) if val_auc_per_fold else float("nan")
@@ -220,10 +260,16 @@ def cross_validate_model(
     print(f"val_accuracy: mean={acc_mean:.4f}, std={acc_std:.4f}")
     print(f"val_auc     : mean={auc_mean:.4f}, std={auc_std:.4f}")
 
-    return {
+    results = {
         "val_accuracy_mean": acc_mean,
         "val_accuracy_std": acc_std,
         "val_auc_mean": auc_mean,
         "val_auc_std": auc_std,
+        "weight_tag": weight_tag,
     }
+    if run_dir:
+        results["cv_models_dir"] = fold_models_dir
+        results["cv_logs_dir"] = fold_logs_dir
+        results["cv_fold_metrics_path"] = fold_metrics_path
+    return results
 

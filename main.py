@@ -84,6 +84,7 @@ if __name__ == "__main__":
             epochs=args.cv_epochs,
             class_names=("NoYawn", "Yawn"),
             sample_weights_path=cv_weights_path,
+            run_dir=run_manager.run_dir,
         )
         print(f"CV results: {cv_results}")
 
@@ -100,6 +101,10 @@ if __name__ == "__main__":
             f.write(f"val_accuracy_std  = {cv_results.get('val_accuracy_std', float('nan')):.4f}\n")
             f.write(f"val_auc_mean      = {cv_results.get('val_auc_mean', float('nan')):.4f}\n")
             f.write(f"val_auc_std       = {cv_results.get('val_auc_std', float('nan')):.4f}\n")
+            f.write(f"weight_tag        = {cv_results.get('weight_tag', 'exp_weights.json')}\n")
+            f.write(f"cv_models_dir     = {cv_results.get('cv_models_dir', 'None')}\n")
+            f.write(f"cv_logs_dir       = {cv_results.get('cv_logs_dir', 'None')}\n")
+            f.write(f"cv_fold_metrics   = {cv_results.get('cv_fold_metrics_path', 'None')}\n")
         print(f"?? CV summary saved to: {cv_summary_path}")
 
     # 6) tf.data pipelines
