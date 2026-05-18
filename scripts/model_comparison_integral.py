@@ -1,23 +1,30 @@
-import os, sys, json
+import os, sys, json, csv
 import numpy as np
 import tensorflow as tf
 from pathlib import Path
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from datetime import datetime
-from PIL import Image, ImageDraw
-import mediapipe as mp
+from typing import Dict, Any, List, Tuple, Optional
 
 # Add root path (project structure assumed same as before)
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.gradcam import CustomGradCAM
+from src.analysis_pipeline import get_analysis_pipeline_from_data_dir
+from src.manifest_helpers import (
+    read_manifest,
+    make_dataset_from_manifest,
+)
+from src.mask_helpers import create_landmark_mask, ROI_IDX
+from src.focus_metrics import compute_focus_ratio, histogram_right_tail_area
 
 
 # ================== CONFIG (YAWNING) ======================
 CONFIG = {
     # Yawning dataset path:
-    "data_dir": r"ydd_splitted_dataset/test",   # <-- change if needed
+    "data_dir": r"ydd_splitted_dataset/test",
     "img_size": (224, 224),
     "dataset_name": "test",
 
@@ -26,7 +33,6 @@ CONFIG = {
     "class_names": ["NoYawn", "Yawn"],
 
     # Mask params
-    "landmark_box_half_size": 15,
     "background_mask_value": 0.2,   # 0.0 = hard mask, 0.2 = soft mask
     "roi_padding_px": 11,
     # When bbox is wide, reduce horizontal padding (pad_x) relative to vertical padding (pad_y).
@@ -37,22 +43,12 @@ CONFIG = {
 
     # Plot
     "hist_bins": 50,
+    "plot_fixed_x_range": True,
+    "plot_x_min": 0.0,
+    "plot_x_max": 1.0,
 }
 
 # 4 models (yawning)
-# IMPORTANT: "original" must exist for threshold
-# MODEL_CONFIGS = [
-#     {"label": "original",   "model_path": r"runs/30_epoch_baseline_e3_yawning/models/final_model.h5"},
-#     {"label": "reward",     "model_path": r"runs/mouth-mask/landmark-15/30_epoch_reward-e3/models/final_model.h5"},
-#     {"label": "log-reward", "model_path": r"runs/mouth-mask/landmark-15/30_epoch_log-reward-e3/models/final_model.h5"},
-#     {"label": "exp-reward", "model_path": r"runs/mouth-mask/landmark-15/30_epoch_exp-reward-e3/models/final_model.h5"},
-# ]
-# MODEL_CONFIGS = [
-#     {"label": "original",   "model_path": r"runs/30_epoch_baseline_e3_yawning/models/final_model.h5"},
-#     {"label": "reward",     "model_path": r"runs/30_epoch_reward-e3/models/final_model.h5"},
-#     {"label": "log-reward", "model_path": r"runs/30_epoch_log-reward-e3/models/final_model.h5"},
-#     {"label": "exp-reward", "model_path": r"runs/30_epoch_exp-reward-e3/models/final_model.h5"},
-# ]
 MODEL_CONFIGS = [
     {"label": "original",   "model_path": r"runs/30_epoch_baseline_e3_yawning/models/final_model.h5"},
     {"label": "reward",     "model_path": r"runs/30_epoch_reward-mouth-jaw-10-landmark/models/final_model.h5"},
@@ -60,243 +56,116 @@ MODEL_CONFIGS = [
     {"label": "exp-reward", "model_path": r"runs/30_epoch_exp-reward-mouth-jaw-9-landmark/models/final_model.h5"},
 ]
 
-# ================== MediaPipe FaceMesh ======================
-mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
-    static_image_mode=True,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-)
-
-# Landmark indices (MediaPipe FaceMesh)
-# For yawning, mouth ROI is most relevant. Keep only MOUTH by default.
-#MOUTH_IDX = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308]
-
-# If you want eyes + mouth, uncomment these and use ROI_IDX = LEFT+RIGHT+MOUTH
-# LEFT_EYE_IDX  = [33, 7, 163, 144, 145, 153, 154, 155, 133]
-# RIGHT_EYE_IDX = [263, 249, 390, 373, 374, 380, 381, 382, 362]
-# ROI_IDX = LEFT_EYE_IDX + RIGHT_EYE_IDX + MOUTH_IDX
-# Mouth landmarks
-MOUTH_IDX = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308]
-
-# Jaw / chin landmarks
-JAW_IDX = [
-    152,                 # chin center
-    377, 400, 378, 379,  # right jaw
-    148, 176, 149, 150   # left jaw
-]
-
-ROI_IDX = MOUTH_IDX + JAW_IDX
-
-
-#================== MASK + FOCUS ======================
-# def create_landmark_mask(image_np_uint8, img_size):
-#     """
-#     image_np_uint8: (H,W,3) RGB uint8 at img_size
-#     returns: (H,W) float32 mask in [0,1] or None if no face
-#     """
-#     h, w = img_size
-#     background_value = float(CONFIG.get("background_mask_value", 0.0))
-
-#     results = mp_face_mesh.process(image_np_uint8)
-#     if not results.multi_face_landmarks:
-#         return None
-
-#     face = results.multi_face_landmarks[0]
-
-#     bg_pil_value = int(background_value * 255)
-#     pil_mask = Image.new("L", (w, h), bg_pil_value)
-#     draw = ImageDraw.Draw(pil_mask)
-
-#     box_half_size = int(CONFIG["landmark_box_half_size"])
-#     for i in MOUTH_IDX:
-#         lm = face.landmark[i]
-#         cx = int(lm.x * w)
-#         cy = int(lm.y * h)
-#         x0 = max(0, cx - box_half_size)
-#         y0 = max(0, cy - box_half_size)
-#         x1 = min(w - 1, cx + box_half_size)
-#         y1 = min(h - 1, cy + box_half_size)
-#         draw.rectangle([x0, y0, x1, y1], outline=255, fill=255)
-
-#     return np.array(pil_mask, dtype=np.float32) / 255.0
-def create_landmark_mask(image_np_uint8, img_size):
-    """
-    ONE rectangular ROI mask based on min/max of mouth+jaw landmarks (+padding).
-    Returns (H,W) float32 mask in [bg..1.0] or None if no face.
-    """
-    h, w = img_size
-    bg = float(CONFIG.get("background_mask_value", 0.0))
-    pad_base = int(CONFIG.get("roi_padding_px", 12))
-
-    results = mp_face_mesh.process(image_np_uint8)
-    if not results.multi_face_landmarks:
-        return None
-
-    face = results.multi_face_landmarks[0]
-
-    xs, ys = [], []
-    for i in ROI_IDX:
-        lm = face.landmark[i]
-        # clamp normalized coords (mediapipe bazen az taşabiliyor)
-        lx = max(0.0, min(1.0, lm.x))
-        ly = max(0.0, min(1.0, lm.y))
-
-        x = int(round(lx * (w - 1)))
-        y = int(round(ly * (h - 1)))
-
-        xs.append(x)
-        ys.append(y)
-
-    if not xs:
-        return None
-
-    x_min, x_max = int(min(xs)), int(max(xs))
-    y_min, y_max = int(min(ys)), int(max(ys))
-    box_w = max(1, x_max - x_min)
-    box_h = max(1, y_max - y_min)
-
-    min_x_scale = float(CONFIG.get("roi_keep_aspect_pad_x_min_scale", 0.2))
-    auto_x_scale = float(box_h / box_w)
-    auto_x_scale = max(min_x_scale, min(1.0, auto_x_scale))
-
-    pad_x = int(round(pad_base * auto_x_scale))
-    pad_y = pad_base
-
-    x0 = max(0, x_min - pad_x)
-    y0 = max(0, y_min - pad_y)
-
-    # IMPORTANT: end-exclusive for slicing
-    x1 = min(w, x_max + pad_x + 1)
-    y1 = min(h, y_max + pad_y + 1)
-
-    # ensure at least 1px ROI
-    if x1 <= x0:
-        x1 = min(w, x0 + 1)
-    if y1 <= y0:
-        y1 = min(h, y0 + 1)
-
-    mask = np.full((h, w), bg, dtype=np.float32)
-    mask[y0:y1, x0:x1] = 1.0
-    return mask
-
-
-
-
-def compute_focus_ratio(heatmap, mask):
-    heatmap = np.maximum(heatmap, 0)
-    mx = float(heatmap.max())
-    if mx > 0:
-        heatmap = heatmap / (mx + 1e-8)
-    focus = float(np.sum(heatmap * mask))
-    total = float(np.sum(heatmap) + 1e-8)
-    return float(focus / total)
-
-
 # ================== CORE ======================
+def _collect_focus_ratios_core(model, image_batches, total_items, img_size):
+    """
+    Shared core for focus-ratio collection regardless of dataset source.
+    `image_batches` should yield tensors shaped like (1, H, W, C).
+    """
+    gradcam = CustomGradCAM(model)
+    ratios = []
+    face_ok = 0
+    total = 0
+
+    for idx, images in enumerate(image_batches):
+        total += 1
+        image = images[0].numpy()
+
+        image_uint8 = (image * 255.0).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
+        image_norm = image_uint8 / 255.0
+
+        prob = float(model.predict(image_norm[None, ...], verbose=0)[0][0])
+        pred = 1 if prob >= 0.5 else 0
+
+        heatmap = gradcam.compute_heatmap(image_norm, class_idx=pred)
+        heatmap = tf.image.resize(
+            heatmap[..., None],
+            img_size,
+            method="bilinear",
+            antialias=True,
+        ).numpy()[..., 0]
+
+        mask = create_landmark_mask(image_uint8, img_size, CONFIG)
+        if mask is not None:
+            face_ok += 1
+            ratios.append(compute_focus_ratio(heatmap, mask))
+
+        if (idx + 1) % 100 == 0:
+            print(f"  Processed {idx+1}/{total_items} | face_ok={face_ok}")
+
+    ratios = np.array(ratios, dtype=np.float32)
+    stats = {
+        "N_total": int(total),
+        "N_face": int(face_ok),
+        "face_rate": float(face_ok / max(total, 1)),
+    }
+    return ratios, stats
+
+
 def collect_focus_ratios(model, data_dir, img_size, class_names):
     """
     Returns:
       focus_ratios: np.array (only face_ok==1)
       stats: dict with N_total, N_face, face_rate
     """
-    gradcam = CustomGradCAM(model)
+    ds, file_paths = get_analysis_pipeline_from_data_dir(data_dir, img_size)
 
-    ds = tf.keras.utils.image_dataset_from_directory(
-        data_dir,
-        labels="inferred",
-        label_mode="binary",
-        class_names=class_names,  # yawning: ["NoYawn","Yawn"]
-        image_size=img_size,
-        batch_size=1,
-        shuffle=False
+    def _image_batches():
+        for data_batch, _path_batch in ds:
+            images, _labels = data_batch
+            yield images
+
+    return _collect_focus_ratios_core(
+        model=model,
+        image_batches=_image_batches(),
+        total_items=len(file_paths),
+        img_size=img_size,
     )
-    file_paths = list(getattr(ds, "file_paths", []))
-    path_ds = tf.data.Dataset.from_tensor_slices(file_paths).batch(1)
-    ds = tf.data.Dataset.zip((ds, path_ds))
-    ds = ds.apply(tf.data.experimental.ignore_errors())
 
-    ratios = []
-    face_ok = 0
-    total = 0
 
-    for idx, (data_batch, path_batch) in enumerate(ds):
-        total += 1
-        images, labels = data_batch
-        image = images[0].numpy()
+def collect_focus_ratios_from_manifest(model, manifest_path, img_size, class_names):
+    """
+    Returns:
+      focus_ratios: np.array (only face_ok==1)
+      stats: dict with N_total, N_face, face_rate
+    """
+    ds = make_dataset_from_manifest(
+        manifest_path=manifest_path,
+        class_names=class_names,
+        img_size=img_size,
+    )
+    file_paths = read_manifest(manifest_path)
 
-        # For MediaPipe: uint8 0..255
-        image_uint8 = (image * 255.0).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
-        # For model: float 0..1
-        image_norm = image_uint8 / 255.0
+    def _image_batches():
+        for images, _labels, _path_batch in ds:
+            yield images
 
-        # prediction -> class_idx for gradcam
-        prob = float(model.predict(image_norm[None, ...], verbose=0)[0][0])
-        pred = 1 if prob >= 0.5 else 0
-
-        # GradCAM heatmap (pred class)
-        heatmap = gradcam.compute_heatmap(image_norm, class_idx=pred)
-        heatmap = tf.image.resize(
-            heatmap[..., None],
-            img_size,
-            method="bilinear",
-            antialias=True
-        ).numpy()[..., 0]
-
-        mask = create_landmark_mask(image_uint8, img_size)
-        if mask is not None:
-            face_ok += 1
-            ratios.append(compute_focus_ratio(heatmap, mask))
-
-        if (idx + 1) % 100 == 0:
-            print(f"  Processed {idx+1}/{len(file_paths)} | face_ok={face_ok}")
-
-    ratios = np.array(ratios, dtype=np.float32)
-    stats = {
-        "N_total": int(total),
-        "N_face": int(face_ok),
-        "face_rate": float(face_ok / max(total, 1))
-    }
-    return ratios, stats
+    return _collect_focus_ratios_core(
+        model=model,
+        image_batches=_image_batches(),
+        total_items=len(file_paths),
+        img_size=img_size,
+    )
 
 
 # ================== PLOT ======================
-# def plot_histograms(results_dict, dataset_name, out_path):
-#     labels = list(results_dict.keys())
-#     labels = [l for l in labels if len(results_dict[l]) > 0]
-#     if not labels:
-#         print("[WARN] No results to plot.")
-#         return
+def _resolve_plot_range(results_dict: Dict[str, np.ndarray], cfg: Dict[str, Any]) -> Tuple[float, float]:
+    if bool(cfg.get("plot_fixed_x_range", True)):
+        return float(cfg.get("plot_x_min", 0.0)), float(cfg.get("plot_x_max", 1.0))
+    nonempty = [v for v in results_dict.values() if v is not None and len(v) > 0]
+    all_vals = np.concatenate(nonempty) if len(nonempty) > 0 else np.array([0.0, 1.0])
+    return float(np.min(all_vals)), float(np.max(all_vals))
 
-#     all_vals = np.concatenate([results_dict[l] for l in labels])
-#     if len(all_vals) == 0:
-#         print("[WARN] Empty arrays, skip plot.")
-#         return
 
-#     bins = int(CONFIG.get("hist_bins", 50))
-#     x_min, x_max = float(all_vals.min()), float(all_vals.max())
-#     bin_edges = np.linspace(x_min, x_max, bins + 1)
-
-#     fig, axes = plt.subplots(1, len(labels), figsize=(5 * len(labels), 4), squeeze=False)
-#     fig.suptitle(f"Focus Ratio Distributions - {dataset_name}", fontsize=14, fontweight="bold")
-
-#     for i, label in enumerate(labels):
-#         ax = axes[0, i]
-#         vals = results_dict[label]
-#         ax.hist(vals, bins=bin_edges, density=True, edgecolor="black", alpha=0.75)
-#         ax.set_title(f"{label} (n={len(vals)})")
-#         ax.set_xlabel("Focus Ratio")
-#         ax.set_ylabel("Density")
-#         ax.grid(True, alpha=0.25)
-#         ax.axvline(np.mean(vals), linestyle="--", linewidth=2, label=f"Mean {np.mean(vals):.3f}")
-#         ax.axvline(np.median(vals), linestyle="--", linewidth=2, label=f"Median {np.median(vals):.3f}")
-#         ax.legend(fontsize=9)
-
-#     plt.tight_layout()
-#     plt.savefig(out_path, dpi=300, bbox_inches="tight")
-#     plt.close()
-#     print(f"[SAVE] {out_path}")
-def plot_focus_ratio_by_model(results_dict, dataset_name, output_path):
+def plot_focus_ratio_by_model(
+    results_dict,
+    dataset_name,
+    output_path,
+    cfg,
+    threshold_T=None,
+    metadata_text="",
+    summary_by_label: Optional[Dict[str, Dict[str, Any]]] = None,
+):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(f'Focus Ratio Distribution by Model - {dataset_name}', fontsize=16, fontweight='bold')
 
@@ -308,17 +177,10 @@ def plot_focus_ratio_by_model(results_dict, dataset_name, output_path):
     ]
 
     # ---------- 1) GLOBAL X RANGE ----------
-    nonempty = [v for v in results_dict.values() if v is not None and len(v) > 0]
-    all_vals = np.concatenate(nonempty) if len(nonempty) > 0 else np.array([0.0, 1.0])
-
-    x_min = float(np.min(all_vals))
-    x_max = float(np.max(all_vals))
-
-    # İstersen sabitle:
-    # x_min, x_max = 0.0, 1.0
+    x_min, x_max = _resolve_plot_range(results_dict, cfg)
 
     # ---------- 2) SAME BINS ----------
-    n_bins = int(CONFIG.get("hist_bins", 50))
+    n_bins = int(cfg.get("hist_bins", 50))
     bin_edges = np.linspace(x_min, x_max, n_bins + 1)
 
     # ---------- 3) GLOBAL Y RANGE ----------
@@ -338,13 +200,14 @@ def plot_focus_ratio_by_model(results_dict, dataset_name, output_path):
         "exp-reward": "red",
     }
 
-    for label, row, col in order:
-        ax = axes[row, col]
+    for label, grid_row, col in order:
+        ax = axes[grid_row, col]
         ratios = results_dict.get(label, np.array([]))
         if ratios is None:
             ratios = np.array([])
 
         if len(ratios) > 0:
+            ratios = np.clip(ratios, x_min, x_max)
             ax.hist(
                 ratios,
                 bins=bin_edges,
@@ -361,21 +224,36 @@ def plot_focus_ratio_by_model(results_dict, dataset_name, output_path):
                        label=f'Median: {median_val:.3f}')
             ax.axvline(mean_val, color='black', linestyle='--', linewidth=2,
                        label=f'Mean: {mean_val:.3f}')
+            if threshold_T is not None:
+                ax.axvline(float(threshold_T), color='purple', linestyle=':', linewidth=2,
+                           label=f'T: {float(threshold_T):.3f}')
+                # Shade right-tail area to visualize integral metric.
+                ax.axvspan(float(threshold_T), x_max, alpha=0.08, color="purple")
 
             ax.set_title(f'{label} (Count: {len(ratios)})', fontsize=13, fontweight='bold')
-            ax.legend(fontsize=10)
+            ax.legend(fontsize=9, loc="upper right")
             ax.grid(True, alpha=0.3)
 
-            stats_text = (
-                f'Mean: {mean_val:.3f}\n'
-                f'Median: {median_val:.3f}\n'
-                f'Std: {np.std(ratios):.3f}\n'
-                f'Min: {np.min(ratios):.3f}\n'
-                f'Max: {np.max(ratios):.3f}'
+            detail_text = [f"Mean: {mean_val:.3f}", f"Std: {np.std(ratios):.3f}"]
+            if summary_by_label and label in summary_by_label:
+                summary_row = summary_by_label[label]
+                val_acc = summary_row.get("val_accuracy")
+                val_auc = summary_row.get("val_auc")
+                val_acc_txt = f"{float(val_acc):.4f}" if val_acc is not None and np.isfinite(float(val_acc)) else "N/A"
+                val_auc_txt = f"{float(val_auc):.4f}" if val_auc is not None and np.isfinite(float(val_auc)) else "N/A"
+                detail_text.extend(
+                    [
+                        f"ΔP: {float(summary_row.get('delta_P_vs_baseline', np.nan)):+.3f}",
+                        f"ΔArea: {float(summary_row.get('delta_Area_hist_vs_baseline', np.nan)):+.3f}",
+                        f"val_acc: {val_acc_txt}",
+                        f"val_auc: {val_auc_txt}",
+                    ]
+                )
+            ax.text(
+                0.02, 0.98, "\n".join(detail_text), transform=ax.transAxes,
+                fontsize=8.5, verticalalignment='top', horizontalalignment='left',
+                family='monospace', bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.75)
             )
-            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
-                    fontsize=9, verticalalignment='top', family='monospace',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         else:
             ax.text(0.5, 0.5, f'No data for {label}',
                     transform=ax.transAxes, ha='center', va='center', fontsize=14)
@@ -386,11 +264,170 @@ def plot_focus_ratio_by_model(results_dict, dataset_name, output_path):
         ax.set_ylim(0, global_ymax)
         ax.set_xlabel('Focus Ratio', fontsize=12)
         ax.set_ylabel('Density', fontsize=12)
+        if metadata_text:
+            ax.text(
+                0.98, 0.02, metadata_text, transform=ax.transAxes,
+                fontsize=8, verticalalignment='bottom', horizontalalignment='right',
+                family='monospace', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5)
+            )
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"[Model Comparison] Histogram saved: {output_path}")
+
+
+def plot_fold_boxplot(rows: List[Dict[str, Any]], output_path: str) -> None:
+    grouped: Dict[str, List[float]] = {}
+    for r in rows:
+        grouped.setdefault(str(r["model_label"]), []).append(float(r["mean_focus"]))
+    labels = [k for k in ["original", "reward", "log-reward", "exp-reward"] if k in grouped]
+    if not labels:
+        return
+    data = [grouped[k] for k in labels]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    box = ax.boxplot(
+        data,
+        labels=labels,
+        showmeans=True,
+        meanprops=dict(marker="^", markerfacecolor="black", markeredgecolor="black", markersize=7),
+        medianprops=dict(color="#FFD54F", linewidth=2),
+        boxprops=dict(linewidth=1.4),
+        whiskerprops=dict(linewidth=1.2),
+        capprops=dict(linewidth=1.2),
+    )
+    ax.set_title("Fold Mean Focus by Model")
+    ax.set_ylabel("Mean Focus")
+    ax.grid(True, alpha=0.3)
+    legend_elements = [
+        Line2D([0], [0], marker="^", color="none", markerfacecolor="black", markeredgecolor="black", markersize=8, label="Triangle (^): fold mean-focus average"),
+        Line2D([0], [0], color="#FFD54F", lw=2, label="Yellow line: median"),
+        Line2D([0], [0], color="black", lw=1.4, label="Box: Q1-Q3 (middle 50%)"),
+    ]
+    ax.legend(handles=legend_elements, loc="best", fontsize=8, framealpha=0.9)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[Model Comparison] Fold boxplot saved: {output_path}")
+
+
+def plot_aggregate_metrics(aggregates: List[Dict[str, Any]], output_path: str) -> None:
+    if len(aggregates) == 0:
+        return
+    labels = [a["weight_type"] for a in aggregates]
+    x = np.arange(len(labels))
+    p_mean = [a["mean_delta_P_vs_baseline"] for a in aggregates]
+    p_std = [a["std_delta_P_vs_baseline"] for a in aggregates]
+    a_mean = [a["mean_delta_Area_hist_vs_baseline"] for a in aggregates]
+    a_std = [a["std_delta_Area_hist_vs_baseline"] for a in aggregates]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    axes[0].bar(x, p_mean, yerr=p_std, capsize=4, alpha=0.8)
+    axes[0].set_title("Mean ΔP vs baseline")
+    axes[0].set_xticks(x, labels, rotation=20)
+    axes[0].axhline(0.0, color="#FFD54F", linestyle="--", linewidth=2, label="Yellow dashed line: no change vs baseline (0)")
+    axes[0].grid(True, axis="y", alpha=0.3)
+    axes[0].legend(fontsize=8, loc="best")
+
+    axes[1].bar(x, a_mean, yerr=a_std, capsize=4, alpha=0.8, color="orange")
+    axes[1].set_title("Mean ΔArea_hist vs baseline")
+    axes[1].set_xticks(x, labels, rotation=20)
+    axes[1].axhline(0.0, color="#FFD54F", linestyle="--", linewidth=2, label="Yellow dashed line: no change vs baseline (0)")
+    axes[1].grid(True, axis="y", alpha=0.3)
+    axes[1].legend(fontsize=8, loc="best")
+
+    fig.text(
+        0.5,
+        0.01,
+        "Bars = fold mean improvement per weight type | Error bars = std across folds",
+        ha="center",
+        fontsize=9,
+    )
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[Model Comparison] Aggregate plot saved: {output_path}")
+
+
+def _build_recommendation_text(
+    *,
+    aggregates: List[Dict[str, Any]],
+    all_rows: List[Dict[str, Any]],
+    output_dir: str,
+) -> str:
+    if len(aggregates) == 0:
+        return "No aggregate data available. Run multi-fold comparison first.\n"
+
+    best_by_delta_p = max(aggregates, key=lambda x: float(x["mean_delta_P_vs_baseline"]))
+    best_by_delta_area = max(aggregates, key=lambda x: float(x["mean_delta_Area_hist_vs_baseline"]))
+    most_stable = min(aggregates, key=lambda x: float(x["std_delta_P_vs_baseline"]))
+
+    lines: List[str] = []
+    lines.append("Model Comparison Recommendation")
+    lines.append("=" * 34)
+    lines.append("")
+    lines.append(f"Generated at: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append(f"Output dir: {output_dir}")
+    lines.append("")
+    lines.append("Delta-P Summary (vs baseline)")
+    lines.append("-" * 30)
+    for a in sorted(aggregates, key=lambda x: x["weight_type"]):
+        lines.append(
+            f"- {a['weight_type']}: mean ΔP={float(a['mean_delta_P_vs_baseline']):+.4f}, "
+            f"std={float(a['std_delta_P_vs_baseline']):.4f}, folds={a.get('fold_ids', [])}"
+        )
+    lines.append("")
+    lines.append("Delta-Area Summary (vs baseline)")
+    lines.append("-" * 34)
+    for a in sorted(aggregates, key=lambda x: x["weight_type"]):
+        lines.append(
+            f"- {a['weight_type']}: mean ΔArea={float(a['mean_delta_Area_hist_vs_baseline']):+.4f}, "
+            f"std={float(a['std_delta_Area_hist_vs_baseline']):.4f}"
+        )
+    lines.append("")
+    lines.append("Quick Recommendation")
+    lines.append("-" * 20)
+    lines.append(
+        f"- Best mean ΔP: {best_by_delta_p['weight_type']} "
+        f"({float(best_by_delta_p['mean_delta_P_vs_baseline']):+.4f})"
+    )
+    lines.append(
+        f"- Best mean ΔArea: {best_by_delta_area['weight_type']} "
+        f"({float(best_by_delta_area['mean_delta_Area_hist_vs_baseline']):+.4f})"
+    )
+    lines.append(
+        f"- Most stable (lowest ΔP std): {most_stable['weight_type']} "
+        f"({float(most_stable['std_delta_P_vs_baseline']):.4f})"
+    )
+    lines.append("")
+    lines.append("Plot Legend Notes")
+    lines.append("-" * 18)
+    lines.append("- aggregate_weight_types.png:")
+    lines.append("  Bars = fold-mean improvement by weight type.")
+    lines.append("  Error bars = standard deviation across folds.")
+    lines.append("  Yellow dashed horizontal line = delta 0 (no change vs baseline).")
+    lines.append("- fold_model_boxplot.png:")
+    lines.append("  Triangle (^) marker = mean value.")
+    lines.append("  Yellow line inside each box = median.")
+    lines.append("  Box = Q1-Q3 (middle 50%); whiskers = spread outside box.")
+    lines.append("")
+    lines.append(f"Total rows analyzed: {len(all_rows)}")
+    return "\n".join(lines) + "\n"
+
+
+def _save_recommendation_text(
+    *,
+    output_dir: str,
+    aggregates: List[Dict[str, Any]],
+    all_rows: List[Dict[str, Any]],
+) -> str:
+    recommendation_path = os.path.join(output_dir, "recommendation.txt")
+    os.makedirs(output_dir, exist_ok=True)
+    text = _build_recommendation_text(aggregates=aggregates, all_rows=all_rows, output_dir=output_dir)
+    with open(recommendation_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return recommendation_path
 
 
 # ================== SUMMARY SAVE ======================
@@ -460,113 +497,48 @@ def print_summary_table_markdown(rows, dataset_name):
             f"{r['std_focus']:.4f} |"
         )
 
-# ================== HISTOGRAM-INTEGRAL (NEW) ======================
-def histogram_right_tail_area(ratios, T, bin_edges):
-    """
-    Approximates integral of the estimated PDF from T to +inf using histogram bins:
-      area ≈ sum_{bins with center >= T} (density_bin * bin_width)
-
-    Requires density=True histogram and a shared bin_edges for fair comparison.
-    """
-    ratios = np.asarray(ratios, dtype=np.float32)
-    if ratios.size == 0:
-        return 0.0
-    hist, edges = np.histogram(ratios, bins=bin_edges, density=True)
-    widths = np.diff(edges)
-    centers = (edges[:-1] + edges[1:]) * 0.5
-    area_bins = hist * widths
-    return float(np.sum(area_bins[centers >= T]))
-
-
-# ================== MAIN ======================
-if __name__ == "__main__":
-    cfg = CONFIG
-    data_dir = cfg["data_dir"]
-    img_size = tuple(cfg["img_size"])
-    dataset_name = cfg.get("dataset_name", Path(data_dir).name)
-
-    os.makedirs("artifacts", exist_ok=True)
-    summary_path = os.path.join("artifacts", f"focus_summary_{dataset_name}.jsonl")
-
-    # 1) Collect ratios per model
-    ratios_by_model = {}
-    stats_by_model = {}
-    model_paths = {}
-
-    for m_cfg in MODEL_CONFIGS:
-        label = m_cfg["label"]
-        model_path = m_cfg["model_path"]
-        model_paths[label] = model_path
-
-        print(f"\n[LOAD] {label}: {model_path}")
-        if not os.path.exists(model_path):
-            print(f"[WARN] Missing model path, skip: {model_path}")
-            continue
-
-        model = tf.keras.models.load_model(model_path, compile=False)
-
-        print(f"[RUN] Collecting focus ratios for {label} ...")
-        ratios, stats = collect_focus_ratios(model, data_dir, img_size, cfg["class_names"])
-
-        ratios_by_model[label] = ratios
-        stats_by_model[label] = stats
-
-        print(f"[DONE] {label}: N_face={stats['N_face']} / N_total={stats['N_total']} | mean={ratios.mean():.4f} | median={np.median(ratios):.4f}")
-
+def _compute_fold_summary_rows(
+    *,
+    fold_id: int,
+    experiment_id: str,
+    weight_type: str,
+    dataset_name: str,
+    data_dir: str,
+    img_size: Tuple[int, int],
+    ratios_by_model: Dict[str, np.ndarray],
+    stats_by_model: Dict[str, Dict[str, Any]],
+    model_paths: Dict[str, str],
+    cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
     if "original" not in ratios_by_model or len(ratios_by_model["original"]) == 0:
-        raise RuntimeError("Baseline 'original' ratios missing/empty. Cannot compute threshold.")
+        raise RuntimeError(f"Fold {fold_id}: baseline 'original' ratios missing/empty.")
 
-    # 2) Threshold from baseline (median)
     T = float(np.median(ratios_by_model["original"]))
-    print("\n================= THRESHOLD =================")
-    print(f"Threshold source: baseline median")
-    print(f"T = median(focus_original) = {T:.4f}")
-
-    # 3) Compute integral metric and write summaries
-    print("\n================= INTEGRAL METRIC =================")
-    # "Integral" == P(focus > T)
-    # Baseline P(focus > T)
     baseline_ratios = ratios_by_model["original"]
     P_baseline = float(np.mean(baseline_ratios > T))
 
-    # (NEW) True histogram-integral style right-tail area with shared bins
-    nonempty = [v for v in ratios_by_model.values() if v is not None and len(v) > 0]
-    all_vals = np.concatenate(nonempty) if len(nonempty) > 0 else np.array([0.0, 1.0], dtype=np.float32)
-    x_min = float(np.min(all_vals))
-    x_max = float(np.max(all_vals))
+    x_min, x_max = _resolve_plot_range(ratios_by_model, cfg)
     n_bins = int(cfg.get("hist_bins", 50))
     bin_edges = np.linspace(x_min, x_max, n_bins + 1)
     A_hist_baseline = histogram_right_tail_area(baseline_ratios, T, bin_edges)
 
-    summary_rows = []
-
+    summary_rows: List[Dict[str, Any]] = []
     for label, ratios in ratios_by_model.items():
         if len(ratios) == 0:
             continue
-
         p_above = float(np.mean(ratios > T))
-        delta_p = p_above - P_baseline   # <<< YENİ METRİK
-
-        # (NEW) histogram-integral right-tail area + delta
+        delta_p = p_above - P_baseline
         area_hist = histogram_right_tail_area(ratios, T, bin_edges)
         delta_area_hist = area_hist - A_hist_baseline
-
         mean_v = float(np.mean(ratios))
         med_v = float(np.median(ratios))
         std_v = float(np.std(ratios))
 
-        print(
-            f"{label:10s} | "
-            f"P(focus>T)={p_above:.4f} | "
-            f"ΔP={delta_p:+.4f} | "
-            f"Area_hist(T..)= {area_hist:.4f} | "
-            f"ΔArea_hist={delta_area_hist:+.4f} | "
-            f"mean={mean_v:.4f} | "
-            f"median={med_v:.4f}"
-        )
-
         summary = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "experiment_id": experiment_id,
+            "fold_id": int(fold_id),
+            "weight_type": weight_type,
             "dataset": dataset_name,
             "data_dir": data_dir,
             "img_size": list(img_size),
@@ -574,22 +546,16 @@ if __name__ == "__main__":
             "model_path": model_paths.get(label, ""),
             "threshold_source": cfg.get("threshold_source", "baseline_median"),
             "threshold_T": T,
-
-            # CORE METRICS
             "P_focus_above_T": p_above,
-            "delta_P_vs_baseline": delta_p,   # <<< KAYITLI
-
-            # (NEW) Histogram-integral metrics (PDF area from T to max)
+            "delta_P_vs_baseline": delta_p,
             "Area_hist_T_to_max": area_hist,
             "delta_Area_hist_vs_baseline": delta_area_hist,
             "hist_bins": int(cfg.get("hist_bins", 50)),
             "hist_x_min": x_min,
             "hist_x_max": x_max,
-
             "mean_focus": mean_v,
             "median_focus": med_v,
             "std_focus": std_v,
-
             "N_total": stats_by_model[label]["N_total"],
             "N_face": stats_by_model[label]["N_face"],
             "face_rate": stats_by_model[label]["face_rate"],
@@ -598,21 +564,426 @@ if __name__ == "__main__":
                 "roi_padding_px": cfg["roi_padding_px"],
                 "background_mask_value": cfg["background_mask_value"],
                 "roi_landmark_count": len(ROI_IDX),
-            }
+            },
         }
         summary_rows.append(summary)
+    return summary_rows
 
-        append_jsonl(summary_path, summary)
 
+def _infer_run_root_from_path(path_str: str) -> Optional[str]:
+    norm = str(path_str).replace("\\", "/")
+    marker = "/runs/"
+    if marker not in norm:
+        return None
+    prefix, suffix = norm.split(marker, 1)
+    suffix_parts = [p for p in suffix.split("/") if p]
+    if len(suffix_parts) < 1:
+        return None
+    return f"{prefix}{marker}{suffix_parts[0]}"
+
+
+def _extract_run_name_from_path(path_str: str) -> Optional[str]:
+    norm = str(path_str).replace("\\", "/")
+    marker = "/runs/"
+    if marker not in norm:
+        return None
+    suffix = norm.split(marker, 1)[1]
+    suffix_parts = [p for p in suffix.split("/") if p]
+    if not suffix_parts:
+        return None
+    return suffix_parts[0]
+
+
+def _load_val_metrics_for_fold(
+    *,
+    fold_id: int,
+    model_paths: Dict[str, str],
+    manifest_path: str,
+) -> Dict[str, Dict[str, float]]:
+    metrics_by_label: Dict[str, Dict[str, float]] = {}
+    candidates: List[str] = []
+    for p in list(model_paths.values()) + [manifest_path]:
+        rr = _infer_run_root_from_path(p)
+        if rr and rr not in candidates:
+            candidates.append(rr)
+
+    if not candidates:
+        return metrics_by_label
+
+    # Prefer first existing candidate on local file system.
+    run_root = None
+    for c in candidates:
+        if os.path.isdir(c):
+            run_root = c
+            break
+    # Fallback: if paths come from another machine (e.g., /SPACE/...),
+    # recover run root by run_name under current project_root/runs.
+    if run_root is None:
+        for p in list(model_paths.values()) + [manifest_path]:
+            run_name = _extract_run_name_from_path(p)
+            if not run_name:
+                continue
+            local_candidate = str(project_root / "runs" / run_name)
+            if os.path.isdir(local_candidate):
+                run_root = local_candidate
+                break
+    if run_root is None:
+        return metrics_by_label
+
+    # Baseline CV metrics -> original
+    cv_fold_metrics = os.path.join(run_root, "cv_logs", "no_weights", "metrics", "cv_fold_metrics.jsonl")
+    if os.path.isfile(cv_fold_metrics):
+        with open(cv_fold_metrics, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                # cv_pipeline writes "fold"; older logs may use "fold_id".
+                rec_fold = rec.get("fold_id", rec.get("fold", -1))
+                try:
+                    if int(rec_fold) != int(fold_id):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                metrics_by_label["original"] = {
+                    "val_accuracy": float(rec.get("val_accuracy", np.nan)),
+                    "val_auc": float(rec.get("val_auc", np.nan)),
+                }
+                break
+
+    # Plain (weighted) metrics -> reward/log-reward/exp-reward
+    plain_summary_csv = os.path.join(run_root, "plain_training_summary.csv")
+    weight_to_label = {
+        "optimized": "reward",
+        "reward": "reward",
+        "log": "log-reward",
+        "exp": "exp-reward",
+    }
+    if os.path.isfile(plain_summary_csv):
+        with open(plain_summary_csv, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    if int(row.get("fold_id", -1)) != int(fold_id):
+                        continue
+                except Exception:
+                    continue
+                weight_name = str(row.get("weight_type", "")).strip().lower()
+                label = weight_to_label.get(weight_name)
+                if not label:
+                    continue
+                try:
+                    val_acc = float(row.get("val_accuracy", np.nan))
+                except Exception:
+                    val_acc = float("nan")
+                try:
+                    val_auc = float(row.get("val_auc", np.nan))
+                except Exception:
+                    val_auc = float("nan")
+                metrics_by_label[label] = {"val_accuracy": val_acc, "val_auc": val_auc}
+
+    return metrics_by_label
+
+
+def _aggregate_by_weight_type(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        label = row.get("model_label")
+        if label == "original":
+            continue
+        key = str(row.get("weight_type", label))
+        grouped.setdefault(key, []).append(row)
+
+    aggregates: List[Dict[str, Any]] = []
+    for weight_type, group in grouped.items():
+        delta_p_values = np.array([float(r["delta_P_vs_baseline"]) for r in group], dtype=np.float32)
+        delta_area_values = np.array([float(r["delta_Area_hist_vs_baseline"]) for r in group], dtype=np.float32)
+        fold_ids = sorted(list({int(r["fold_id"]) for r in group}))
+
+        aggregates.append(
+            {
+                "weight_type": weight_type,
+                "n_rows": int(len(group)),
+                "fold_ids": fold_ids,
+                "mean_delta_P_vs_baseline": float(np.mean(delta_p_values)),
+                "std_delta_P_vs_baseline": float(np.std(delta_p_values)),
+                "mean_delta_Area_hist_vs_baseline": float(np.mean(delta_area_values)),
+                "std_delta_Area_hist_vs_baseline": float(np.std(delta_area_values)),
+            }
+        )
+    return sorted(aggregates, key=lambda x: x["weight_type"])
+
+
+def _save_aggregates(
+    aggregates: List[Dict[str, Any]],
+    aggregate_json_path: str,
+    aggregate_csv_path: str,
+) -> None:
+    os.makedirs(os.path.dirname(aggregate_json_path), exist_ok=True)
+    with open(aggregate_json_path, "w", encoding="utf-8") as f:
+        json.dump(aggregates, f, indent=2, ensure_ascii=False)
+
+    with open(aggregate_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "weight_type",
+                "n_rows",
+                "fold_ids",
+                "mean_delta_P_vs_baseline",
+                "std_delta_P_vs_baseline",
+                "mean_delta_Area_hist_vs_baseline",
+                "std_delta_Area_hist_vs_baseline",
+            ],
+        )
+        writer.writeheader()
+        for row in aggregates:
+            flat_row = dict(row)
+            flat_row["fold_ids"] = ",".join(str(x) for x in row.get("fold_ids", []))
+            writer.writerow(flat_row)
+
+
+def run_single_fold_comparison(
+    *,
+    fold_id: int,
+    val_manifest_path: str,
+    model_configs: List[Dict[str, str]],
+    output_dir: str,
+    experiment_id: str = "default",
+    weight_type: Optional[str] = None,
+    config_override: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    cfg = dict(CONFIG)
+    if config_override:
+        cfg.update(config_override)
+
+    img_size = tuple(cfg["img_size"])
+    dataset_name = cfg.get("dataset_name", f"fold_{fold_id}_val")
+    resolved_weight_type = weight_type if weight_type is not None else "mixed"
+    data_dir = f"manifest:{val_manifest_path}"
+
+    ratios_by_model: Dict[str, np.ndarray] = {}
+    stats_by_model: Dict[str, Dict[str, Any]] = {}
+    model_paths: Dict[str, str] = {}
+
+    print(f"\n================= FOLD {fold_id} =================")
+    print(f"Manifest: {val_manifest_path}")
+    for m_cfg in model_configs:
+        label = m_cfg["label"]
+        model_path = m_cfg["model_path"]
+        model_paths[label] = model_path
+        print(f"\n[LOAD] fold={fold_id} label={label}: {model_path}")
+        if not os.path.exists(model_path):
+            print(f"[WARN] Missing model path, skip: {model_path}")
+            continue
+        model = tf.keras.models.load_model(model_path, compile=False)
+        print(f"[RUN] Collecting focus ratios for fold={fold_id}, label={label} ...")
+        ratios, stats = collect_focus_ratios_from_manifest(
+            model=model,
+            manifest_path=val_manifest_path,
+            img_size=img_size,
+            class_names=cfg["class_names"],
+        )
+        ratios_by_model[label] = ratios
+        stats_by_model[label] = stats
+        if len(ratios) > 0:
+            print(
+                f"[DONE] {label}: N_face={stats['N_face']} / N_total={stats['N_total']} "
+                f"| mean={ratios.mean():.4f} | median={np.median(ratios):.4f}"
+            )
+        else:
+            print(f"[DONE] {label}: No valid ratios.")
+
+    summary_rows = _compute_fold_summary_rows(
+        fold_id=fold_id,
+        experiment_id=experiment_id,
+        weight_type=resolved_weight_type,
+        dataset_name=dataset_name,
+        data_dir=data_dir,
+        img_size=img_size,
+        ratios_by_model=ratios_by_model,
+        stats_by_model=stats_by_model,
+        model_paths=model_paths,
+        cfg=cfg,
+    )
+    val_metrics_by_label = _load_val_metrics_for_fold(
+        fold_id=fold_id,
+        model_paths=model_paths,
+        manifest_path=val_manifest_path,
+    )
+    if val_metrics_by_label:
+        print(f"[VAL METRICS] fold={fold_id} loaded metrics:")
+        for label_key in ["original", "reward", "log-reward", "exp-reward"]:
+            if label_key not in val_metrics_by_label:
+                continue
+            m = val_metrics_by_label[label_key]
+            print(
+                f"  - {label_key}: "
+                f"val_acc={m.get('val_accuracy', float('nan'))} | "
+                f"val_auc={m.get('val_auc', float('nan'))}"
+            )
+    else:
+        print(f"[VAL METRICS] fold={fold_id} no val_acc/val_auc found (will show N/A on plots).")
+    for row in summary_rows:
+        label = str(row.get("model_label", ""))
+        m = val_metrics_by_label.get(label, {})
+        row["val_accuracy"] = m.get("val_accuracy")
+        row["val_auc"] = m.get("val_auc")
+
+    plots_dir = os.path.join(output_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    fold_hist_path = os.path.join(plots_dir, f"fold_{fold_id}_hist.png")
+    threshold_T = summary_rows[0]["threshold_T"] if len(summary_rows) > 0 else None
+    n_face = summary_rows[0]["N_face"] if len(summary_rows) > 0 else 0
+    n_total = summary_rows[0]["N_total"] if len(summary_rows) > 0 else 0
+    metadata_text = f"fold={fold_id}\nN_face={n_face}/{n_total}\nbins={cfg.get('hist_bins', 50)}"
+    plot_focus_ratio_by_model(
+        ratios_by_model,
+        f"{dataset_name}_fold_{fold_id}",
+        fold_hist_path,
+        cfg=cfg,
+        threshold_T=threshold_T,
+        metadata_text=metadata_text,
+        summary_by_label={str(r["model_label"]): r for r in summary_rows},
+    )
+    print_summary_table(summary_rows, f"{dataset_name}_fold_{fold_id}")
+    print_summary_table_markdown(summary_rows, f"{dataset_name}_fold_{fold_id}")
+    return summary_rows
+
+
+def run_multi_fold_comparison(
+    *,
+    fold_ids: List[int],
+    val_manifest_by_fold: Dict[int, str],
+    model_map_by_fold: Dict[int, List[Dict[str, str]]],
+    output_dir: str = "artifacts/model_comparison",
+    experiment_id: str = "model_comparison_folds",
+    weight_type_map_by_label: Optional[Dict[str, str]] = None,
+    config_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    os.makedirs(output_dir, exist_ok=True)
+    fold_metrics_path = os.path.join(output_dir, "fold_metrics.jsonl")
+    aggregate_json_path = os.path.join(output_dir, "aggregate_by_weight_type.json")
+    aggregate_csv_path = os.path.join(output_dir, "aggregate_by_weight_type.csv")
+    aggregate_plot_path = os.path.join(output_dir, "plots", "aggregate_weight_types.png")
+    fold_boxplot_path = os.path.join(output_dir, "plots", "fold_model_boxplot.png")
+
+    all_rows: List[Dict[str, Any]] = []
+    for fold_id in fold_ids:
+        manifest_path = val_manifest_by_fold.get(fold_id)
+        model_configs = model_map_by_fold.get(fold_id, [])
+        if not manifest_path:
+            print(f"[WARN] fold={fold_id} manifest missing, skip.")
+            continue
+        if len(model_configs) == 0:
+            print(f"[WARN] fold={fold_id} model configs missing, skip.")
+            continue
+
+        summary_rows = run_single_fold_comparison(
+            fold_id=fold_id,
+            val_manifest_path=manifest_path,
+            model_configs=model_configs,
+            output_dir=output_dir,
+            experiment_id=experiment_id,
+            weight_type="mixed",
+            config_override=config_override,
+        )
+        for row in summary_rows:
+            row["weight_type"] = weight_type_map_by_label.get(row["model_label"], row["model_label"]) if weight_type_map_by_label else row["model_label"]
+            append_jsonl(fold_metrics_path, row)
+        all_rows.extend(summary_rows)
+
+    aggregates = _aggregate_by_weight_type(all_rows)
+    _save_aggregates(
+        aggregates=aggregates,
+        aggregate_json_path=aggregate_json_path,
+        aggregate_csv_path=aggregate_csv_path,
+    )
+
+    os.makedirs(os.path.join(output_dir, "plots"), exist_ok=True)
+    plot_aggregate_metrics(aggregates, aggregate_plot_path)
+    plot_fold_boxplot(all_rows, fold_boxplot_path)
+    recommendation_path = _save_recommendation_text(
+        output_dir=output_dir,
+        aggregates=aggregates,
+        all_rows=all_rows,
+    )
+
+    print(f"\n[SAVE] Fold metrics: {fold_metrics_path}")
+    print(f"[SAVE] Aggregate JSON: {aggregate_json_path}")
+    print(f"[SAVE] Aggregate CSV: {aggregate_csv_path}")
+    print(f"[SAVE] Aggregate Plot: {aggregate_plot_path}")
+    print(f"[SAVE] Fold Boxplot: {fold_boxplot_path}")
+    print(f"[SAVE] Recommendation: {recommendation_path}")
+    return {
+        "fold_metrics_path": fold_metrics_path,
+        "aggregate_json_path": aggregate_json_path,
+        "aggregate_csv_path": aggregate_csv_path,
+        "aggregate_plot_path": aggregate_plot_path,
+        "fold_boxplot_path": fold_boxplot_path,
+        "recommendation_path": recommendation_path,
+        "rows_count": len(all_rows),
+        "aggregate_count": len(aggregates),
+    }
+
+
+# ================== MAIN ======================
+if __name__ == "__main__":
+    # Backward-compatible single-run mode
+    cfg = CONFIG
+    data_dir = cfg["data_dir"]
+    img_size = tuple(cfg["img_size"])
+    dataset_name = cfg.get("dataset_name", Path(data_dir).name)
+    output_dir = "artifacts/model_comparison_legacy"
+    os.makedirs(output_dir, exist_ok=True)
+
+    ratios_by_model = {}
+    stats_by_model = {}
+    model_paths = {}
+    for m_cfg in MODEL_CONFIGS:
+        label = m_cfg["label"]
+        model_path = m_cfg["model_path"]
+        model_paths[label] = model_path
+        print(f"\n[LOAD] {label}: {model_path}")
+        if not os.path.exists(model_path):
+            print(f"[WARN] Missing model path, skip: {model_path}")
+            continue
+        model = tf.keras.models.load_model(model_path, compile=False)
+        print(f"[RUN] Collecting focus ratios for {label} ...")
+        ratios, stats = collect_focus_ratios(model, data_dir, img_size, cfg["class_names"])
+        ratios_by_model[label] = ratios
+        stats_by_model[label] = stats
+
+    summary_rows = _compute_fold_summary_rows(
+        fold_id=0,
+        experiment_id="legacy_main",
+        weight_type="mixed",
+        dataset_name=dataset_name,
+        data_dir=data_dir,
+        img_size=img_size,
+        ratios_by_model=ratios_by_model,
+        stats_by_model=stats_by_model,
+        model_paths=model_paths,
+        cfg=cfg,
+    )
+    summary_path = os.path.join(output_dir, f"focus_summary_{dataset_name}.jsonl")
+    for row in summary_rows:
+        append_jsonl(summary_path, row)
+    hist_path = os.path.join(output_dir, f"model_focus_comparison_{dataset_name}.png")
+    threshold_T = summary_rows[0]["threshold_T"] if len(summary_rows) > 0 else None
+    plot_focus_ratio_by_model(
+        ratios_by_model,
+        dataset_name,
+        hist_path,
+        cfg=cfg,
+        threshold_T=threshold_T,
+        metadata_text=f"fold=0\nbins={cfg.get('hist_bins', 50)}",
+    )
     print(f"\n[SAVE] Summary appended to: {summary_path}")
     print_summary_table(summary_rows, dataset_name)
     print_summary_table_markdown(summary_rows, dataset_name)
-
-
-    # 4) Plot histograms (optional but useful)
-    hist_path = os.path.join("artifacts", f"model_focus_comparison_mouth-jaw-{cfg['roi_padding_px']}_{dataset_name}.png")
-    plot_focus_ratio_by_model(ratios_by_model, dataset_name, hist_path)
-    #plot_histograms(ratios_by_model, dataset_name, hist_path)
-
-
     print("\n[DONE]")

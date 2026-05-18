@@ -7,6 +7,8 @@ import tensorflow as tf
 
 from .model import build_model
 from .train import train_model
+from .utils import plot_history, plot_metrics
+from .evaluate import evaluate_model
 
 
 def _load_full_train_paths_and_labels(
@@ -15,11 +17,11 @@ def _load_full_train_paths_and_labels(
     class_names: Tuple[str, str],
 ) -> Tuple[List[str], np.ndarray]:
     """
-    Load all image file paths and labels from base_dir/train using Keras utility
+    Load all image file paths and labels from base_dir using Keras utility
     (batch_size=1, shuffle=False so that file_paths aligns with labels).
     """
     ds = tf.keras.utils.image_dataset_from_directory(
-        os.path.join(base_dir, "train"),
+        base_dir,
         labels="inferred",
         label_mode="binary",
         class_names=list(class_names),
@@ -118,10 +120,11 @@ def cross_validate_model(
     epochs: int = 30,
     class_names: Tuple[str, str] = ("NoYawn", "Yawn"),
     sample_weights_path: str = None,
+    fold_sample_weights_dir: str = None,
     run_dir: str = None,
 ) -> Dict[str, float]:
     """
-    Simple k-fold cross-validation over base_dir/train.
+    Simple k-fold cross-validation over base_dir.
 
     - Uses only the existing train split for CV.
     - Test split stays untouched for final evaluation later.
@@ -136,7 +139,7 @@ def cross_validate_model(
 
     n_samples = len(file_paths)
     if n_samples == 0:
-        raise ValueError(f"No training images found under {os.path.join(base_dir, 'train')}")
+        raise ValueError(f"No training images found under {base_dir}")
 
     indices = np.arange(n_samples)
     rng = np.random.default_rng(seed)
@@ -151,6 +154,12 @@ def cross_validate_model(
         with open(sample_weights_path, "r", encoding="utf-8") as f:
             global_weights_by_path = json.load(f)
         print(f"[CV] Loaded global sample weights from: {sample_weights_path}")
+    if fold_sample_weights_dir:
+        if not os.path.isdir(fold_sample_weights_dir):
+            raise FileNotFoundError(
+                f"Fold sample weights directory not found: {fold_sample_weights_dir}"
+            )
+        print(f"[CV] Using fold-specific sample weights from: {fold_sample_weights_dir}")
 
     val_acc_per_fold: List[float] = []
     val_auc_per_fold: List[float] = []
@@ -160,14 +169,21 @@ def cross_validate_model(
     fold_logs_dir = None
     fold_metrics_path = None
     weight_tag = "no_weights"
-    if sample_weights_path:
+    if fold_sample_weights_dir:
+        weight_tag = os.path.basename(os.path.normpath(fold_sample_weights_dir))
+    elif sample_weights_path:
         weight_tag = os.path.splitext(os.path.basename(sample_weights_path))[0]
     if run_dir:
         fold_models_dir = os.path.join(run_dir, "cv_models", weight_tag)
         fold_logs_dir = os.path.join(run_dir, "cv_logs", weight_tag)
+        fold_logs_metrics_dir = os.path.join(fold_logs_dir, "metrics")
+        fold_logs_plots_dir = os.path.join(fold_logs_dir, "plots")
+        fold_logs_manifests_dir = os.path.join(fold_logs_dir, "manifests")
         os.makedirs(fold_models_dir, exist_ok=True)
-        os.makedirs(fold_logs_dir, exist_ok=True)
-        fold_metrics_path = os.path.join(fold_logs_dir, "cv_fold_metrics.jsonl")
+        os.makedirs(fold_logs_metrics_dir, exist_ok=True)
+        os.makedirs(fold_logs_plots_dir, exist_ok=True)
+        os.makedirs(fold_logs_manifests_dir, exist_ok=True)
+        fold_metrics_path = os.path.join(fold_logs_metrics_dir, "cv_fold_metrics.jsonl")
         print(f"[CV] Fold models will be saved to: {fold_models_dir}")
         print(f"[CV] Fold logs will be saved to: {fold_logs_dir}")
 
@@ -181,11 +197,24 @@ def cross_validate_model(
         val_labels = labels[val_idx]
 
         train_sample_weights = None
-        if global_weights_by_path is not None:
-            train_root = os.path.join(base_dir, "train")
+        fold_weights_by_path = None
+        if fold_sample_weights_dir:
+            fold_id = fold_idx + 1
+            fold_weights_path = os.path.join(
+                fold_sample_weights_dir, f"fold_{fold_id}_weights.json"
+            )
+            if not os.path.isfile(fold_weights_path):
+                raise FileNotFoundError(
+                    f"Fold weights JSON missing for fold {fold_id}: {fold_weights_path}"
+                )
+            with open(fold_weights_path, "r", encoding="utf-8") as f:
+                fold_weights_by_path = json.load(f)
+
+        active_weights = fold_weights_by_path if fold_weights_by_path is not None else global_weights_by_path
+        if active_weights is not None:
             train_sample_weights = np.array(
                 [
-                    float(global_weights_by_path.get(os.path.relpath(fp, train_root).replace("\\", "/"), 1.0))
+                    float(active_weights.get(os.path.relpath(fp, base_dir).replace("\\", "/"), 1.0))
                     for fp in train_files
                 ],
                 dtype=np.float32,
@@ -215,9 +244,9 @@ def cross_validate_model(
             initial_epoch=0,
         )
 
-        # History keys: 'loss', 'accuracy', 'precision', 'recall', 'auc', 'val_loss', ...
-        val_acc = history.history.get("val_accuracy", [None])[-1]
-        val_auc = history.history.get("val_auc", [None])[-1]
+        # Use best validation metrics across epochs.
+        val_acc = float(np.nanmax(history.history.get("val_accuracy", [float("nan")])))
+        val_auc = float(np.nanmax(history.history.get("val_auc", [float("nan")])))
 
         print(
             f"Fold {fold_idx + 1}: val_accuracy={val_acc:.4f} | val_auc={val_auc:.4f}"
@@ -228,13 +257,38 @@ def cross_validate_model(
         if val_auc is not None:
             val_auc_per_fold.append(float(val_auc))
 
-        # Save fold model + val file list for follow-up focus analysis
+        # Save fold model + train/val file lists for follow-up focus analysis
         if run_dir:
             fold_id = fold_idx + 1
             model_path = os.path.join(fold_models_dir, f"fold_{fold_id}.h5")
             model.save(model_path)
 
-            val_manifest_path = os.path.join(fold_logs_dir, f"fold_{fold_id}_val_files.txt")
+            # Save fold training history + plots for baseline/weighted CV visibility
+            fold_history_path = os.path.join(fold_logs_metrics_dir, f"fold_{fold_id}_history.json")
+            with open(fold_history_path, "w", encoding="utf-8") as hf:
+                json.dump(history.history, hf, indent=2)
+            fold_history_plot_path = os.path.join(fold_logs_plots_dir, f"fold_{fold_id}_history.png")
+            fold_metrics_plot_path = os.path.join(fold_logs_plots_dir, f"fold_{fold_id}_metrics.png")
+            plot_history(history, save_path=fold_history_plot_path)
+            plot_metrics(history, save_path=fold_metrics_plot_path)
+
+            fold_eval_plots_dir = os.path.join(run_dir, "plots", f"cv_fold_{fold_id}_val")
+            os.makedirs(fold_eval_plots_dir, exist_ok=True)
+            evaluate_model(
+                model,
+                val_ds,
+                plots_dir=fold_eval_plots_dir,
+                class_names=list(class_names),
+                subject_diverse_dir=None,
+                ds_name="val",
+            )
+
+            train_manifest_path = os.path.join(fold_logs_manifests_dir, f"fold_{fold_id}_train_files.txt")
+            with open(train_manifest_path, "w", encoding="utf-8") as mf:
+                for p in train_files:
+                    mf.write(f"{p}\n")
+
+            val_manifest_path = os.path.join(fold_logs_manifests_dir, f"fold_{fold_id}_val_files.txt")
             with open(val_manifest_path, "w", encoding="utf-8") as mf:
                 for p in val_files:
                     mf.write(f"{p}\n")
@@ -243,7 +297,14 @@ def cross_validate_model(
                 "fold": fold_id,
                 "weight_tag": weight_tag,
                 "model_path": model_path,
+                "train_manifest_path": train_manifest_path,
                 "val_manifest_path": val_manifest_path,
+                "history_path": fold_history_path,
+                "history_plot_path": fold_history_plot_path,
+                "metrics_plot_path": fold_metrics_plot_path,
+                "eval_plots_dir": fold_eval_plots_dir,
+                "subject_diverse_dir": None,
+                "train_size": int(len(train_files)),
                 "val_size": int(len(val_files)),
                 "val_accuracy": float(val_acc) if val_acc is not None else None,
                 "val_auc": float(val_auc) if val_auc is not None else None,
@@ -272,4 +333,3 @@ def cross_validate_model(
         results["cv_logs_dir"] = fold_logs_dir
         results["cv_fold_metrics_path"] = fold_metrics_path
     return results
-

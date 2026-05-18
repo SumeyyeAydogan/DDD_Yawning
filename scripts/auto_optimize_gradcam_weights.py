@@ -21,15 +21,18 @@ import tensorflow as tf
 from pathlib import Path
 from statistics import median
 import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw
-import mediapipe as mp
 import argparse
+from typing import Optional, Set
 
 # Add root path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.gradcam import CustomGradCAM
+from src.analysis_pipeline import get_analysis_pipeline_from_data_dir
+from src.mask_helpers import create_landmark_mask, create_static_mask
+from src.focus_metrics import compute_focus_ratio
+from src.manifest_helpers import read_manifest
 
 
 # ================== CONFIG ======================
@@ -37,7 +40,7 @@ CONFIG = {
     "model_path": r"runs/30_epoch_baseline_e3_yawning/models/final_model.h5",
     "data_dir": r"ydd_splitted_dataset/train",
     "img_size": (224, 224),
-    "roi_padding_px": 9,          # Padding around the mouth+jaw bounding box (in pixels)
+    "roi_padding_px": 6,          # Padding around the mouth+jaw bounding box (in pixels)
     # When bbox is wide, reduce horizontal padding (pad_x) relative to vertical padding (pad_y).
     # This helps avoid including too much irrelevant horizontal background.
     "roi_keep_aspect_pad_x_min_scale": 0.2,
@@ -58,141 +61,13 @@ CONFIG = {
     # "penalize": Low focus ratio → High weight (penalize bad behavior)
 }
 
-# MediaPipe FaceMesh initialization
-mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
-    static_image_mode=True,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-)
-
-# Landmark indices for eyes and mouth (MediaPipe FaceMesh)
-MOUTH_IDX = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308]
-
-# Jaw / chin landmarks
-JAW_IDX = [
-    152,                 # chin center
-    377, 400, 378, 379,  # right jaw
-    148, 176, 149, 150   # left jaw
-]
-
-ROI_IDX = MOUTH_IDX + JAW_IDX
-
-
-# ================== MASK ======================
-def create_landmark_mask(image_np_uint8, img_size):
-    """
-    ONE rectangular ROI mask based on min/max of mouth+jaw landmarks (+padding).
-    Returns (H,W) float32 mask in [bg..1.0] or None if no face.
-    """
-    h, w = img_size
-    bg = float(CONFIG.get("background_mask_value", 0.0))
-    pad_base = int(CONFIG.get("roi_padding_px", 12))
-
-    results = mp_face_mesh.process(image_np_uint8)
-    if not results.multi_face_landmarks:
-        return None
-
-    face = results.multi_face_landmarks[0]
-
-    xs, ys = [], []
-    for i in ROI_IDX:
-        lm = face.landmark[i]
-        # clamp normalized coords (mediapipe bazen az taşabiliyor)
-        lx = max(0.0, min(1.0, lm.x))
-        ly = max(0.0, min(1.0, lm.y))
-
-        x = int(round(lx * (w - 1)))
-        y = int(round(ly * (h - 1)))
-
-        xs.append(x)
-        ys.append(y)
-
-    if not xs:
-        return None
-
-    x_min, x_max = int(min(xs)), int(max(xs))
-    y_min, y_max = int(min(ys)), int(max(ys))
-    box_w = max(1, x_max - x_min)
-    box_h = max(1, y_max - y_min)
-
-    # bbox çok yatıksa pad_x otomatik küçülür
-    min_x_scale = float(CONFIG.get("roi_keep_aspect_pad_x_min_scale", 0.2))
-    auto_x_scale = float(box_h / box_w)
-    auto_x_scale = max(min_x_scale, min(1.0, auto_x_scale))
-
-    pad_x = int(round(pad_base * auto_x_scale))
-    pad_y = pad_base
-
-    x0 = max(0, x_min - pad_x)
-    y0 = max(0, y_min - pad_y)
-
-    # IMPORTANT: end-exclusive for slicing
-    x1 = min(w, x_max + pad_x + 1)
-    y1 = min(h, y_max + pad_y + 1)
-
-    # ensure at least 1px ROI
-    if x1 <= x0:
-        x1 = min(w, x0 + 1)
-    if y1 <= y0:
-        y1 = min(h, y0 + 1)
-
-    mask = np.full((h, w), bg, dtype=np.float32)
-    mask[y0:y1, x0:x1] = 1.0
-    return mask
-
-
-def create_static_mask_fallback(img_size):
-    """
-    Create static mask as fallback when landmark detection fails.
-    Uses same logic as src/simple_mask.py.
-    """
-    h, w = img_size
-    background_value = CONFIG.get("background_mask_value", 0.0)
-    
-    # Define regions (same as simple_mask.py)
-    eye_top = int(0.2 * h)
-    eye_bottom = int(0.53 * h)
-    eye_left = int(0.1 * w)
-    eye_right = int(0.9 * w)
-    
-    mouth_top = int(0.57 * h)
-    mouth_bottom = int(0.9 * h)
-    mouth_left = int(0.2 * w)
-    mouth_right = int(0.8 * w)
-    
-    # Mask: ROI = 1.0, background = background_value
-    mask = np.ones((h, w), dtype=np.float32) * background_value
-    
-    # Eye region
-    mask[eye_top:eye_bottom, eye_left:eye_right] = 1.0
-    
-    # Mouth region
-    mask[mouth_top:mouth_bottom, mouth_left:mouth_right] = 1.0
-    
-    return mask
-
-def compute_focus_ratio(heatmap, mask):
-    """
-    Compute focus ratio: how much of the heatmap is in the ROI mask.
-    
-    Args:
-        heatmap: Normalized heatmap (0-1)
-        mask: ROI mask (0-1)
-    
-    Returns:
-        Focus ratio (0-1): higher = more focus on ROI
-    """
-    heatmap = np.maximum(heatmap, 0)  # Ensure non-negative
-    if heatmap.max() > 0:
-        heatmap = heatmap / (heatmap.max() + 1e-8)  # Normalize to 0-1
-    focus = np.sum(heatmap * mask)      # ROI'deki toplam heatmap
-    total = np.sum(heatmap) + 1e-8      # Tüm heatmap toplamı
-    return float(focus / total)
-
-
 # ================== CORE ======================
-def collect_focus_distribution(model, data_dir, img_size):
+def collect_focus_distribution(
+    model,
+    data_dir,
+    img_size,
+    include_rel_paths: Optional[Set[str]] = None,
+):
     """
     Collect focus ratios for all images using dynamic landmark masks.
     
@@ -203,19 +78,14 @@ def collect_focus_distribution(model, data_dir, img_size):
     """
     gradcam = CustomGradCAM(model)
 
-    ds = tf.keras.utils.image_dataset_from_directory(
-        data_dir, labels="inferred", label_mode="binary",
-        image_size=img_size, batch_size=1, shuffle=False
-    )
-    file_paths = list(getattr(ds, "file_paths", []))
-    path_ds = tf.data.Dataset.from_tensor_slices(file_paths).batch(1)
-    ds = tf.data.Dataset.zip((ds, path_ds))
-    ds = ds.apply(tf.data.experimental.ignore_errors())
+    ds, file_paths = get_analysis_pipeline_from_data_dir(data_dir, img_size)
 
     ratios = []
+    filtered_file_paths = []
     landmark_success_count = 0
     static_fallback_count = 0
 
+    data_dir_abs = os.path.abspath(data_dir)
     print("[AutoOpt] Computing focus distribution...")
     print("[AutoOpt] Using landmark mask with fallback to static (if enabled).")
     print(f"[AutoOpt] Landmark roi-padding: {CONFIG['roi_padding_px']}")
@@ -223,6 +93,12 @@ def collect_focus_distribution(model, data_dir, img_size):
 
     for idx, (data_batch, path_batch) in enumerate(ds):
         images, labels = data_batch
+        sample_path = path_batch.numpy()[0].decode("utf-8")
+        rel_path = os.path.relpath(os.path.abspath(sample_path), data_dir_abs).replace("\\", "/")
+        if include_rel_paths is not None and rel_path not in include_rel_paths:
+            print(f"[AutoOpt] Skipping {rel_path} (not in manifest)")
+            continue
+
         image = images[0].numpy()
         label = int(labels[0].numpy())
         
@@ -242,10 +118,10 @@ def collect_focus_distribution(model, data_dir, img_size):
         ).numpy()[..., 0]
 
         # Create dynamic landmark mask for this image (always try landmark; optional static fallback)
-        mask = create_landmark_mask(image_uint8, img_size)
+        mask = create_landmark_mask(image_uint8, img_size, CONFIG)
         if mask is None:
             if CONFIG['fallback_to_static']:
-                mask = create_static_mask_fallback(img_size)
+                mask = create_static_mask(img_size, CONFIG)
                 static_fallback_count += 1
             else:
                 print(f"[WARN] No face detected in image {idx+1}, skipping...")
@@ -255,6 +131,7 @@ def collect_focus_distribution(model, data_dir, img_size):
 
         ratio = compute_focus_ratio(heatmap, mask)
         ratios.append(ratio)
+        filtered_file_paths.append(sample_path)
 
         if (idx + 1) % 50 == 0:
             print(f"  Processed {idx + 1}/{len(file_paths)} "
@@ -263,7 +140,7 @@ def collect_focus_distribution(model, data_dir, img_size):
     print(f"\n[AutoOpt] Summary: {landmark_success_count} landmark masks, "
           f"{static_fallback_count} static fallbacks, {len(ratios)} total processed")
 
-    return ratios, file_paths
+    return ratios, filtered_file_paths
 
 
 # ================== OPTIMIZATION ======================
@@ -547,6 +424,11 @@ if __name__ == "__main__":
         default="artifacts",
         help="Directory to write outputs (optimized_gradcam_weights.json, gradcam_opt_params.json, report, histogram).",
     )
+    parser.add_argument(
+        "--manifest-path",
+        default=None,
+        help="Optional manifest path (absolute paths) to restrict optimization/weights to a fold train subset.",
+    )
 
     args = parser.parse_args()
 
@@ -569,10 +451,30 @@ if __name__ == "__main__":
     artifacts_dir = args.artifacts_dir
     os.makedirs(artifacts_dir, exist_ok=True)
 
+    include_rel_paths = None
+    if args.manifest_path:
+        manifest_files = read_manifest(args.manifest_path)
+        data_dir_abs = os.path.abspath(cfg["data_dir"])
+        include_rel_paths = set()
+        for p in manifest_files:
+            p_norm = str(p).strip().replace("\\", "/")
+            # Support both absolute-manifest and relative-manifest entries.
+            if os.path.isabs(p):
+                rel = os.path.relpath(os.path.abspath(p), data_dir_abs).replace("\\", "/")
+                include_rel_paths.add(rel)
+            else:
+                include_rel_paths.add(p_norm.lstrip("./"))
+        print(f"[AutoOpt] Restricting to manifest samples: {len(include_rel_paths)}")
+
     model = tf.keras.models.load_model(cfg["model_path"], compile=False)
 
     ratios, file_paths = collect_focus_distribution(
-        model, cfg["data_dir"], cfg["img_size"])
+        model, cfg["data_dir"], cfg["img_size"], include_rel_paths=include_rel_paths)
+    if len(ratios) == 0:
+        raise RuntimeError(
+            "No samples were processed for optimization. "
+            "Likely manifest/data_dir path mismatch or all samples were skipped."
+        )
 
     params = choose_params(ratios, cfg["search_level"])
     print("\n[AutoOpt] Best Params:", {k: v for k, v in params.items() 
