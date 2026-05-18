@@ -27,130 +27,40 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable, List
+from typing import List
 
 import numpy as np
-from PIL import Image, ImageDraw, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
 
-import mediapipe as mp
+import sys
+
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from src.mask_helpers import (
+    create_landmark_mask,
+    image_to_float01_rgb,
+    image_to_uint8_rgb,
+    img_size_from_rgb,
+)
 
 
 # ------------ CONFIG ------------
 PROJECT_ROOT = Path(__file__).parent.parent
 
 SOURCE_SPLIT_ROOT = PROJECT_ROOT / "ydd_splitted_dataset"
-TARGET_SPLIT_ROOT = PROJECT_ROOT / "ydd_splitted_dataset_landmark_mouth-jaw-10-px-pad-keep-aspect"
+TARGET_SPLIT_ROOT = PROJECT_ROOT / "ydd_splitted_dataset_roi"
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 CLASSES = ("NoYawn", "Yawn")
 SPLITS = ("train", "val", "test")
 
-# Background value for non-ROI pixels: 0 = black
-BACKGROUND_VALUE = 0.0  # you can set 0.2, 0.5, etc. if you want gray background
-
-# Padding (in pixels) around the mouth+jaw rectangular ROI
-ROI_PADDING_PX = 10
-
-# Keep-aspect padding:
-# - bbox çok yataysa (box_w >> box_h) yatay pad'i (pad_x) otomatik kıs.
-# - dikey pad (pad_y) aynı kalır.
-ROI_KEEP_ASPECT_PAD_X_MIN_SCALE = 0.2
-
-
-mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
-    static_image_mode=True,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-)
-
-# Example landmark index sets for eyes + mouth (MediaPipe FaceMesh)
-# You can tweak these if you want larger/smaller regions.
-LEFT_EYE_IDX: List[int] = [33, 7, 163, 144, 145, 153, 154, 155, 133]
-RIGHT_EYE_IDX: List[int] = [263, 249, 390, 373, 374, 380, 381, 382, 362]
-MOUTH_IDX: List[int] = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308]
-
-# Jaw / chin landmarks (same as in `model_comparision_integral.py`)
-JAW_IDX: List[int] = [
-    152,                 # chin center
-    377, 400, 378, 379,  # right jaw
-    148, 176, 149, 150,  # left jaw
-]
-
-# Combined ROI landmarks (mouth + jaw)
-ROI_IDX: List[int] = MOUTH_IDX + JAW_IDX
-
-
-def create_mouth_jaw_mask(image_np: np.ndarray, face_landmarks) -> np.ndarray:
-    """
-    image_np: (H, W, 3) RGB uint8
-    face_landmarks: mp_face_mesh result for a single face
-
-    Adapted from `create_landmark_mask` in `model_comparision_integral.py`.
-    Builds a single rectangular ROI covering **mouth + jaw** landmarks
-    with some padding.
-
-    Returns:
-        (H, W) float32 mask in {0, 1} where:
-            1 = mouth + jaw rectangular ROI
-            0 = everything else
-    """
-    h, w = image_np.shape[:2]
-
-    xs: List[int] = []
-    ys: List[int] = []
-    for idx in ROI_IDX:
-        lm = face_landmarks.landmark[idx]
-
-        # Clamp normalized coords (mediapipe bazen çok az taşabiliyor)
-        lx = max(0.0, min(1.0, lm.x))
-        ly = max(0.0, min(1.0, lm.y))
-
-        x = int(round(lx * (w - 1)))
-        y = int(round(ly * (h - 1)))
-
-        xs.append(x)
-        ys.append(y)
-
-    if not xs:
-        # Fallback: empty mask
-        return np.zeros((h, w), dtype=np.float32)
-
-    x_min = int(min(xs))
-    x_max = int(max(xs))
-    y_min = int(min(ys))
-    y_max = int(max(ys))
-
-    box_w = max(1, x_max - x_min)
-    box_h = max(1, y_max - y_min)
-
-    pad_base = int(ROI_PADDING_PX)
-
-    # bbox çok yatıksa pad_x küçülür; bbox dikey ise pad_x büyümez (cap=1.0).
-    min_x_scale = float(ROI_KEEP_ASPECT_PAD_X_MIN_SCALE)
-    auto_x_scale = float(box_h / box_w)
-    auto_x_scale = max(min_x_scale, min(1.0, auto_x_scale))
-
-    pad_x = int(round(pad_base * auto_x_scale))
-    pad_y = pad_base
-
-    x0 = max(0, x_min - pad_x)
-    y0 = max(0, y_min - pad_y)
-
-    # end‑exclusive bounds for slicing
-    x1 = min(w, x_max + pad_x + 1)
-    y1 = min(h, y_max + pad_y + 1)
-
-    # ensure at least 1px ROI
-    if x1 <= x0:
-        x1 = min(w, x0 + 1)
-    if y1 <= y0:
-        y1 = min(h, y0 + 1)
-
-    mask = np.zeros((h, w), dtype=np.float32)
-    mask[y0:y1, x0:x1] = 1.0
-    return mask
-
+# Shared mask params (keys match auto_optimize / statistics scripts)
+MASK_CONFIG = {
+    "roi_padding_px": 6,
+    "roi_keep_aspect_pad_x_min_scale": 0.2,
+    "background_mask_value": 0.0,  # 0 = black outside ROI; 0.2 = soft mask
+}
 
 def apply_mask_to_image(img: Image.Image, mask: np.ndarray) -> Image.Image:
     """
@@ -158,14 +68,14 @@ def apply_mask_to_image(img: Image.Image, mask: np.ndarray) -> Image.Image:
 
     Eye+mouth pixels remain; everything else is set to BACKGROUND_VALUE.
     """
-    img_np = np.array(img).astype(np.float32) / 255.0  # (H, W, 3)
+    img_float01 = image_to_float01_rgb(np.array(img))
     if mask.ndim == 2:
         mask_3 = np.stack([mask] * 3, axis=-1)
     else:
         mask_3 = mask
 
-    bg = float(BACKGROUND_VALUE)
-    masked = img_np * mask_3 + (1.0 - mask_3) * bg
+    bg = float(MASK_CONFIG["background_mask_value"])
+    masked = img_float01 * mask_3 + (1.0 - mask_3) * bg
     out_np = (np.clip(masked, 0.0, 1.0) * 255).astype(np.uint8)
     return Image.fromarray(out_np)
 
@@ -178,20 +88,16 @@ def process_one_image(src_path: Path, dst_path: Path) -> None:
         # Corrupted or non-image file → just skip or copy original if you want
         print(f"[WARN] Skipping unreadable image: {src_path} ({e})")
         return  # veya: dst_path.parent.mkdir(...); shutil.copy(src_path, dst_path); return
-    img_np = np.array(img)  # RGB uint8
+    image_rgb_uint8 = image_to_uint8_rgb(np.array(img))
+    img_size = img_size_from_rgb(image_rgb_uint8)
 
-    # MediaPipe expects RGB uint8 array
-    results = mp_face_mesh.process(img_np)
-
-    if not results.multi_face_landmarks:
+    mask = create_landmark_mask(image_rgb_uint8, img_size, MASK_CONFIG)
+    if mask is None:
         # If no face is found, simply copy the original image.
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         img.save(dst_path)
         print(f"[WARN] No face detected, copied original: {src_path}")
         return
-
-    face = results.multi_face_landmarks[0]
-    mask = create_mouth_jaw_mask(img_np, face)  # (H, W) in {0, 1}
 
     masked_img = apply_mask_to_image(img, mask)
 
@@ -233,5 +139,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

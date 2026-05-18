@@ -3,14 +3,15 @@ import numpy as np
 import tensorflow as tf
 from pathlib import Path
 import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw
-import mediapipe as mp
 
 # Add root path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.gradcam import CustomGradCAM
+from src.ds_with_paths_pipeline import get_dataset_with_paths
+from src.focus_metrics import compute_focus_ratio
+from src.mask_helpers import create_landmark_mask, image_to_float01_rgb, image_to_uint8_rgb
 
 
 # ================== CONFIG ======================
@@ -21,103 +22,15 @@ CONFIG = {
     "img_size": (224, 224),
     "model_name": "original model",  # Model name for histogram title
     "dataset_name": "test",  # Dataset name for histogram title
-    "use_landmark_mask": True,  # Use dynamic landmark mask
-    #"landmark_box_half_size": 15,  # Half side-length of square patches around landmarks
-    "roi_padding_px": 12,
+    "roi_padding_px": 6,
+    "roi_keep_aspect_pad_x_min_scale": 0.2,
     "background_mask_value": 0.2,  # Background value for non-ROI regions (0.0 = hard mask, 0.2 = soft mask)
+    "gradcam_class_source": "model_prediction"
 }
-
-# MediaPipe FaceMesh initialization
-mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
-    static_image_mode=True,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-)
-
-# Landmark indices for eyes and mouth (MediaPipe FaceMesh)
-MOUTH_IDX = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308]
-
-# Jaw / chin landmarks
-JAW_IDX = [
-    152,                 # chin center
-    377, 400, 378, 379,  # right jaw
-    148, 176, 149, 150   # left jaw
-]
-
-ROI_IDX = MOUTH_IDX + JAW_IDX
-
-
-# ================== MASK ======================
-def create_landmark_mask(image_np_uint8, img_size):
-    """
-    ONE rectangular ROI mask based on min/max of mouth+jaw landmarks (+padding).
-    Returns (H,W) float32 mask in [bg..1.0] or None if no face.
-    """
-    h, w = img_size
-    bg = float(CONFIG.get("background_mask_value", 0.0))
-    pad = int(CONFIG.get("roi_padding_px", 12))
-
-    results = mp_face_mesh.process(image_np_uint8)
-    if not results.multi_face_landmarks:
-        return None
-
-    face = results.multi_face_landmarks[0]
-
-    xs, ys = [], []
-    for i in ROI_IDX:
-        lm = face.landmark[i]
-        # clamp normalized coords (mediapipe bazen az taşabiliyor)
-        lx = max(0.0, min(1.0, lm.x))
-        ly = max(0.0, min(1.0, lm.y))
-
-        x = int(round(lx * (w - 1)))
-        y = int(round(ly * (h - 1)))
-
-        xs.append(x)
-        ys.append(y)
-
-    if not xs:
-        return None
-
-    x0 = max(0, min(xs) - pad)
-    y0 = max(0, min(ys) - pad)
-
-    # IMPORTANT: end-exclusive for slicing
-    x1 = min(w, max(xs) + pad + 1)
-    y1 = min(h, max(ys) + pad + 1)
-
-    # ensure at least 1px ROI
-    if x1 <= x0:
-        x1 = min(w, x0 + 1)
-    if y1 <= y0:
-        y1 = min(h, y0 + 1)
-
-    mask = np.full((h, w), bg, dtype=np.float32)
-    mask[y0:y1, x0:x1] = 1.0
-    return mask
-
-def compute_focus_ratio(heatmap, mask):
-    """
-    Compute focus ratio: how much of the heatmap is in the ROI mask.
-    
-    Args:
-        heatmap: Normalized heatmap (0-1)
-        mask: ROI mask (0-1)
-    
-    Returns:
-        Focus ratio (0-1): higher = more focus on ROI
-    """
-    heatmap = np.maximum(heatmap, 0)  # Ensure non-negative
-    if heatmap.max() > 0:
-        heatmap = heatmap / (heatmap.max() + 1e-8)  # Normalize to 0-1
-    focus = np.sum(heatmap * mask)      # ROI'deki toplam heatmap
-    total = np.sum(heatmap) + 1e-8      # Tüm heatmap toplamı
-    return float(focus / total)
 
 
 # ================== CORE ======================
-def collect_focus_distribution_with_predictions(model, data_dir, img_size):
+def collect_focus_ratios_by_prediction_outcome(model, data_dir, img_size):
     """
     Collect focus ratios and model predictions for all images using dynamic landmark masks.
     
@@ -125,24 +38,16 @@ def collect_focus_distribution_with_predictions(model, data_dir, img_size):
         y_true: List of true labels
         y_pred: List of predicted labels (0 or 1)
         y_prob: List of prediction probabilities
-        focus_ratios: List of focus ratios
+        focus_ratios_pred_class: List of focus ratios
     """
     gradcam = CustomGradCAM(model)
 
-    ds = tf.keras.utils.image_dataset_from_directory(
-        data_dir, labels="inferred", label_mode="binary",
-        class_names=["NoYawn", "Yawn"],  # Explicit class order: NoYawn=0, Yawn=1
-        image_size=img_size, batch_size=1, shuffle=False
-    )
-    file_paths = list(getattr(ds, "file_paths", []))
-    path_ds = tf.data.Dataset.from_tensor_slices(file_paths).batch(1)
-    ds = tf.data.Dataset.zip((ds, path_ds))
-    ds = ds.apply(tf.data.experimental.ignore_errors())
+    ds, file_paths = get_dataset_with_paths(data_dir, img_size)
 
     y_true = []
     y_pred = []
     y_prob = []
-    focus_ratios = []
+    focus_ratios_pred_class = []
     landmark_success_count = 0
 
     print("[Statistics] Computing focus distribution with predictions...")
@@ -154,18 +59,17 @@ def collect_focus_distribution_with_predictions(model, data_dir, img_size):
         image = images[0].numpy()
         label = int(labels[0].numpy())
         
-        # Convert to uint8 for MediaPipe (0-255 range)
-        image_uint8 = (image * 255.0).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
-        image_normalized = image_uint8 / 255.0 if image.max() > 1.0 else image
+        image_rgb_uint8 = image_to_uint8_rgb(image)
+        image_float01 = image_to_float01_rgb(image)
 
         # Get model prediction
-        preds = model.predict(image_normalized[None, ...], verbose=0)
+        preds = model.predict(image_float01[None, ...], verbose=0)
         prob = float(preds[0][0])
         pred = 1 if prob >= 0.5 else 0
         
         # Use predicted class for GradCAM
         class_idx = pred
-        heatmap = gradcam.compute_heatmap(image_normalized, class_idx=class_idx)
+        heatmap = gradcam.compute_heatmap(image_float01, class_idx=class_idx)
         
         # Resize heatmap to match image size with bilinear interpolation
         heatmap = tf.image.resize(
@@ -176,11 +80,9 @@ def collect_focus_distribution_with_predictions(model, data_dir, img_size):
         ).numpy()[..., 0]
 
         # Create dynamic landmark mask for this image
-        mask = None
-        if CONFIG['use_landmark_mask']:
-            mask = create_landmark_mask(image_uint8, img_size)
-            if mask is not None:
-                landmark_success_count += 1
+        mask = create_landmark_mask(image_rgb_uint8, img_size, CONFIG)
+        if mask is not None:
+            landmark_success_count += 1
         
         # If no valid mask, skip this image
         if mask is None:
@@ -192,16 +94,16 @@ def collect_focus_distribution_with_predictions(model, data_dir, img_size):
         y_true.append(label)
         y_pred.append(pred)
         y_prob.append(prob)
-        focus_ratios.append(ratio)
+        focus_ratios_pred_class.append(ratio)
 
         if (idx + 1) % 50 == 0:
             print(f"  Processed {idx + 1}/{len(file_paths)} "
                   f"(landmark: {landmark_success_count})")
 
     print(f"\n[Statistics] Summary: {landmark_success_count} landmark masks, "
-          f"{len(focus_ratios)} total processed")
+          f"{len(focus_ratios_pred_class)} total processed")
 
-    return y_true, y_pred, y_prob, focus_ratios
+    return y_true, y_pred, y_prob, focus_ratios_pred_class
 
 # ================== ANALYSIS ======================
 def get_confusion_matrix_groups(y_true, y_pred):
@@ -223,26 +125,26 @@ def get_confusion_matrix_groups(y_true, y_pred):
     
     return groups
 
-def plot_focus_ratio_by_confusion_matrix(y_true, y_pred, focus_ratios, model_name, dataset_name, output_path):
+def plot_focus_ratio_by_confusion_matrix(y_true, y_pred, focus_ratios_pred_class, model_name, dataset_name, output_path):
     """
     Plot focus ratio distributions for TN, TP, FN, FP groups in separate subplots.
     Uses shared/global bins + shared x/y-axis limits for apples-to-apples comparison.
     """
     groups = get_confusion_matrix_groups(y_true, y_pred)
-    focus_ratios = np.array(focus_ratios, dtype=np.float32)
+    focus_ratios_pred_class = np.array(focus_ratios_pred_class, dtype=np.float32)
 
-    # ---- Guard: hiç sample yoksa ----
-    if focus_ratios.size == 0:
+    # ---- Guard: no samples ----
+    if focus_ratios_pred_class.size == 0:
         print("[WARN] No focus ratios to plot. Skipping histogram.")
         return
 
     # ---- Shared X range ----
-    # Focus ratio teorik olarak [0, 1]. En temiz karşılaştırma:
+    # Focus ratio is in [0, 1] in theory; fixed [0,1] range is the cleanest comparison:
     x_min, x_max = 0.0, 1.0
 
-    # Eğer illa dataya göre belirlemek istersen:
-    # x_min = float(np.min(focus_ratios))
-    # x_max = float(np.max(focus_ratios))
+    # If you prefer limits driven purely by the data instead:
+    # x_min = float(np.min(focus_ratios_pred_class))
+    # x_max = float(np.max(focus_ratios_pred_class))
     # if np.isclose(x_min, x_max):
     #     x_min = max(0.0, x_min - 1e-3)
     #     x_max = min(1.0, x_max + 1e-3)
@@ -257,9 +159,9 @@ def plot_focus_ratio_by_confusion_matrix(y_true, y_pred, focus_ratios, model_nam
         idxs = groups[g]
         if len(idxs) == 0:
             continue
-        vals = focus_ratios[idxs]
+        vals = focus_ratios_pred_class[idxs]
 
-        # Clamp (olur da sayısal taşma vs varsa)
+        # Clamp (numeric edge cases / overflow)
         vals = np.clip(vals, x_min, x_max)
 
         hist, _ = np.histogram(vals, bins=bins, density=True)
@@ -282,12 +184,12 @@ def plot_focus_ratio_by_confusion_matrix(y_true, y_pred, focus_ratios, model_nam
         ax = axes[row, col]
         indices = groups[group_name]
 
-        # Ortak eksen limitleri (HER subplot için)
+        # Shared axis limits (every subplot)
         ax.set_xlim(x_min, x_max)
         ax.set_ylim(0, y_max)
 
         if len(indices) > 0:
-            group_ratios = focus_ratios[indices]
+            group_ratios = focus_ratios_pred_class[indices]
             group_ratios = np.clip(group_ratios, x_min, x_max)
 
             ax.hist(
@@ -353,7 +255,7 @@ if __name__ == "__main__":
     dataset_name = cfg.get("dataset_name", Path(cfg["data_dir"]).name)
 
     # Collect focus ratios with predictions
-    y_true, y_pred, y_prob, focus_ratios = collect_focus_distribution_with_predictions(
+    y_true, y_pred, y_prob, focus_ratios_pred_class = collect_focus_ratios_by_prediction_outcome(
         model, cfg["data_dir"], cfg["img_size"])
 
     # Calculate confusion matrix groups
@@ -371,7 +273,7 @@ if __name__ == "__main__":
     for group_name in ['TN', 'TP', 'FN', 'FP']:
         indices = groups[group_name]
         if len(indices) > 0:
-            group_ratios = np.array(focus_ratios)[indices]
+            group_ratios = np.array(focus_ratios_pred_class)[indices]
             print(f"  {group_name}: Mean={np.mean(group_ratios):.3f}, "
                   f"Median={np.median(group_ratios):.3f}, "
                   f"Std={np.std(group_ratios):.3f}, Count={len(indices)}")
@@ -387,7 +289,7 @@ if __name__ == "__main__":
     
     # Plot focus ratio distributions by confusion matrix groups
     plot_focus_ratio_by_confusion_matrix(
-        y_true, y_pred, focus_ratios, 
+        y_true, y_pred, focus_ratios_pred_class, 
         model_name, dataset_name, 
         output_path
     )

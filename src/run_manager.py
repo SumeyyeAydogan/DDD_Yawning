@@ -31,39 +31,55 @@ class RunManager:
         model.save_weights(checkpoint_path)
         print(f"💾 Checkpoint saved: {checkpoint_path}")
         
-    def save_metrics(self, history, epoch):
-        """Save training metrics to CSV"""
+    def save_metrics(self, metrics_logs, epoch):
+        """Save training metrics to CSV (one row per epoch)."""
         csv_path = os.path.join(self.run_dir, "training_metrics.csv")
         
         # Prepare metrics data
         metrics_data = {
-            'epoch': [epoch],
-            'timestamp': [datetime.now().isoformat()]
+            'epoch': epoch,
+            'timestamp': datetime.now().isoformat()
         }
         
-        # Add all available metrics
-        for metric_name, metric_values in history.history.items():
-            if len(metric_values) > 0:
-                metrics_data[metric_name] = [metric_values[-1]]  # Last value of this epoch
+        # Add all available metrics from Keras epoch logs (already scalar values)
+        if metrics_logs is not None:
+            for metric_name, metric_value in metrics_logs.items():
+                metrics_data[metric_name] = metric_value
         
         # Save to CSV
         self._append_to_csv(csv_path, metrics_data)
         print(f"📊 Metrics saved for epoch {epoch}")
         
     def _append_to_csv(self, csv_path, data):
-        """Append data to CSV file"""
+        """Append data to CSV file with stable metric columns."""
         # Check if file exists to determine if we need headers
         file_exists = os.path.exists(csv_path)
+        fieldnames = [
+            "epoch",
+            "timestamp",
+            "loss",
+            "accuracy",
+            "precision",
+            "recall",
+            "auc",
+            "val_loss",
+            "val_accuracy",
+            "val_precision",
+            "val_recall",
+            "val_auc",
+            "lr",
+        ]
+        row = {key: data.get(key, "") for key in fieldnames}
         
         with open(csv_path, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=data.keys())
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             
             # Write headers if file is new
             if not file_exists:
                 writer.writeheader()
             
             # Write data
-            writer.writerow(data)
+            writer.writerow(row)
     
     def save_final_model(self, model):
         """Save final trained model"""

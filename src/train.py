@@ -25,7 +25,7 @@ def train_model(model, train_ds, val_ds, epochs=10, callbacks=None, initial_epoc
         metrics=['accuracy'],  # Keep basic accuracy unweighted
         weighted_metrics=[Precision(name='precision'), Recall(name='recall'), AUC(name='auc')],  # These will use sample_weight
         #metrics=['accuracy', Precision(name='precision'), Recall(name='recall'), AUC(name='auc')]
-        #run_eagerly=True it was releated to sample_weight but we don't need it anymore thanks to graph-safe solution
+        run_eagerly=True #it is releated to sample_weight
     )
     
     # Prepare callbacks
@@ -34,7 +34,7 @@ def train_model(model, train_ds, val_ds, epochs=10, callbacks=None, initial_epoc
     """ batch = next(iter(train_ds))
     print([t.shape for t in batch])  # zaten biliyoruz (32, 224,224,3), (32,1), (32,)
 
-    # Tek batch ile dene:
+    # Try with a single batch:
     model.train_on_batch(*batch) """
     # Train model
     history = model.fit(

@@ -1,8 +1,30 @@
 import matplotlib.pyplot as plt
 import numpy as np
+import csv
 from sklearn.metrics import roc_curve, auc, precision_recall_curve, confusion_matrix
 import seaborn as sns
 import os
+
+
+def _load_history_from_csv(save_path):
+    if not save_path:
+        return {}
+    run_dir = os.path.dirname(os.path.dirname(save_path))
+    csv_path = os.path.join(run_dir, "training_metrics.csv")
+    if not os.path.exists(csv_path):
+        return {}
+    hist = {}
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            for key, value in row.items():
+                if key in ("epoch", "timestamp") or value in (None, ""):
+                    continue
+                try:
+                    hist.setdefault(key, []).append(float(value))
+                except ValueError:
+                    continue
+    return hist
 
 def create_run_directories(run_name="run_001"):
     """Create basic run directory structure"""
@@ -17,7 +39,7 @@ def create_run_directories(run_name="run_001"):
     return run_dir
 
 def plot_dataset_distribution(data_dir="data", save_path=None):
-    """Plot distribution of yawn vs no yawn in train/val/test datasets"""
+    """Plot distribution of drowsy vs notdrowsy in train/val/test datasets"""
     import glob
     
     datasets = ['train', 'val', 'test']
@@ -31,29 +53,22 @@ def plot_dataset_distribution(data_dir="data", save_path=None):
             no_yawn_counts.append(0)
             continue
 
-        # Support two layouts:
-        # 1) Old: files named with *_1.* (drowsy) and *_0.* (not drowsy)
-        # 2) New: class subfolders {NotDrowsy, Drowsy} under each split
-        old_style_yawn = glob.glob(os.path.join(dataset_path, "*_1.*"))
-        old_style_no_yawn = glob.glob(os.path.join(dataset_path, "*_0.*"))
+        # Class subfolders {NoYawn, Yawn} under each split
 
         no_yawn_dir = os.path.join(dataset_path, 'NoYawn')
         yawn_dir = os.path.join(dataset_path, 'Yawn')
 
-        if (len(old_style_yawn) + len(old_style_no_yawn)) > 0:
-            yawn_counts.append(len(old_style_yawn))
-            no_yawn_counts.append(len(old_style_no_yawn))
-        elif os.path.isdir(no_yawn_dir) and os.path.isdir(yawn_dir):
-            nd_count = sum(
+        if os.path.isdir(no_yawn_dir) and os.path.isdir(yawn_dir):
+            ny_count = sum(
                 1 for f in os.listdir(no_yawn_dir)
                 if os.path.isfile(os.path.join(no_yawn_dir, f))
             )
-            d_count = sum(
+            y_count = sum(
                 1 for f in os.listdir(yawn_dir)
                 if os.path.isfile(os.path.join(yawn_dir, f))
             )
-            no_yawn_counts.append(nd_count)
-            yawn_counts.append(d_count)
+            no_yawn_counts.append(ny_count)
+            yawn_counts.append(y_count)
         else:
             # Unknown layout; count as zero to avoid crashes
             yawn_counts.append(0)
@@ -106,6 +121,7 @@ def plot_dataset_distribution(data_dir="data", save_path=None):
         print(f"💾 Dataset distribution plot saved: {save_path}")
     
     plt.show()
+    plt.close()
     
     # Print summary
     print("\n📊 Dataset Distribution Summary:")
@@ -124,13 +140,22 @@ def plot_dataset_distribution(data_dir="data", save_path=None):
 
 def plot_history(history, save_path=None):
     """Plot training history: accuracy and loss"""
+    history_dict = getattr(history, "history", {}) if history is not None else {}
+    if "accuracy" not in history_dict or "loss" not in history_dict:
+        csv_hist = _load_history_from_csv(save_path)
+        if "accuracy" in csv_hist and "loss" in csv_hist:
+            history_dict = csv_hist
+        else:
+            print("No plottable training history found (history object or CSV).")
+            return
+
     plt.figure(figsize=(12, 5))
     
     # Accuracy plot
     plt.subplot(1, 2, 1)
-    plt.plot(history.history['accuracy'], label='Train')
-    if 'val_accuracy' in history.history:
-        plt.plot(history.history['val_accuracy'], label='Validation')
+    plt.plot(history_dict['accuracy'], label='Train')
+    if 'val_accuracy' in history_dict:
+        plt.plot(history_dict['val_accuracy'], label='Validation')
     plt.title('Accuracy')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy')
@@ -139,9 +164,9 @@ def plot_history(history, save_path=None):
 
     # Loss plot
     plt.subplot(1, 2, 2)
-    plt.plot(history.history['loss'], label='Train')
-    if 'val_loss' in history.history:
-        plt.plot(history.history['val_loss'], label='Validation')
+    plt.plot(history_dict['loss'], label='Train')
+    if 'val_loss' in history_dict:
+        plt.plot(history_dict['val_loss'], label='Validation')
     plt.title('Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
@@ -156,11 +181,16 @@ def plot_history(history, save_path=None):
         print(f"💾 Plot saved: {save_path}")
     
     plt.show()
+    plt.close()
 
 def plot_metrics(history, save_path=None):
     """Plot additional metrics: precision, recall, auc"""
+    history_dict = getattr(history, "history", {}) if history is not None else {}
+    if not history_dict:
+        history_dict = _load_history_from_csv(save_path)
+
     metrics = ['precision', 'recall', 'auc']
-    available_metrics = [m for m in metrics if m in history.history]
+    available_metrics = [m for m in metrics if m in history_dict]
     
     if not available_metrics:
         print("No additional metrics found in history")
@@ -169,9 +199,9 @@ def plot_metrics(history, save_path=None):
     plt.figure(figsize=(15, 5))
     for i, metric in enumerate(available_metrics):
         plt.subplot(1, len(available_metrics), i+1)
-        plt.plot(history.history[metric], label=f'Train {metric}')
-        if f'val_{metric}' in history.history:
-            plt.plot(history.history[f'val_{metric}'], label=f'Val {metric}')
+        plt.plot(history_dict[metric], label=f'Train {metric}')
+        if f'val_{metric}' in history_dict:
+            plt.plot(history_dict[f'val_{metric}'], label=f'Val {metric}')
         plt.title(f'{metric.upper()}')
         plt.xlabel('Epoch')
         plt.ylabel(metric.upper())
@@ -186,6 +216,7 @@ def plot_metrics(history, save_path=None):
         print(f"💾 Plot saved: {save_path}")
     
     plt.show()
+    plt.close()
 
 def save_evaluation_report(report, roc_auc, test_accuracy, test_loss, save_path):
     with open(save_path, "w") as f:
@@ -212,6 +243,7 @@ def plot_confusion_matrix(y_true, y_pred, class_names=['NoYawn', 'Yawn'], save_p
         print(f"💾 Plot saved: {save_path}")
     
     plt.show()
+    plt.close()
 
 def plot_roc_curve(y_true, y_pred_proba, save_path=None):
     """Plot ROC curve"""
@@ -236,6 +268,7 @@ def plot_roc_curve(y_true, y_pred_proba, save_path=None):
         print(f"💾 Plot saved: {save_path}")
     
     plt.show()
+    plt.close()
 
 def plot_precision_recall_curve(y_true, y_pred_proba, save_path=None):
     """Plot Precision-Recall curve"""
@@ -257,3 +290,4 @@ def plot_precision_recall_curve(y_true, y_pred_proba, save_path=None):
         print(f"💾 Plot saved: {save_path}")
     
     plt.show()
+    plt.close()

@@ -7,7 +7,7 @@ but with parameters defined manually inside the script (no CLI args).
 from __future__ import annotations
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Iterable
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 import random
 
@@ -35,23 +35,20 @@ MATCH_MODE = "stem"  # "stem" or "filename"
 LAYOUT = "vertical"  # "horizontal" or "vertical"
 EXTENSIONS = [".png", ".jpg", ".jpeg"]
 OUTPUT_SUFFIX = "_combined.png"
-
 FONT_PATH = None  # or Path("path/to/font.ttf")
 FONT_SIZE = 30
 LABEL_PADDING = 6
 LABEL_BG = "#ffffff"
 LABEL_FG = "#111111"
-
 SHUFFLE = False
 LIMIT = None
 SEED = 42
-
 INCLUDE_HISTORY = True
 HISTORY_RELPATH = "plots/training_history.png"
 HISTORY_OUTPUT_NAME = "training_history_combined.png"
 HISTORY_LAYOUT = "vertical"  # or "horizontal"/"vertical"
 
-# ✅ NEW: test confusion matrix merge
+# Test confusion matrix merge
 INCLUDE_TEST_CONFUSION_MATRIX = True
 TEST_CM_RELPATH = "plots/test_confusion_matrix.png"
 TEST_CM_OUTPUT_NAME = "test_confusion_matrix_combined.png"
@@ -73,11 +70,7 @@ def load_font(font_path: Path | None, size: int) -> ImageFont.ImageFont:
 
 
 def collect_gradcam_index(
-    run: RunSpec,
-    roots: Sequence[str],
-    extensions: Sequence[str],
-    match_mode: str,
-    verbose: bool = False,
+    run: RunSpec, roots: Sequence[str], extensions: Sequence[str], match_mode: str, verbose: bool = False
 ) -> Dict[str, Path]:
     index: Dict[str, Path] = {}
     for rel in roots:
@@ -159,16 +152,7 @@ def determine_keys(run_indexes: Dict[RunSpec, Dict[str, Path]], requested_keys, 
 
 
 def combine_gradcam_sets(
-    run_specs,
-    run_indexes,
-    keys,
-    layout,
-    output_dir,
-    output_suffix,
-    font,
-    label_bg,
-    label_fg,
-    padding,
+    run_specs, run_indexes, keys, layout, output_dir, output_suffix, font, label_bg, label_fg, padding
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     saved_paths: List[Path] = []
@@ -210,7 +194,7 @@ def combine_histories(run_specs, history_relpath, output_path, layout, font, lab
     return output_path
 
 
-# ✅ NEW: confusion matrix combiner (training_history ile aynı mantık)
+# Confusion matrix combiner
 def combine_test_confusion_matrices(run_specs, cm_relpath, output_path, layout, font, label_bg, label_fg, padding):
     panels = []
     for run in run_specs:
@@ -240,7 +224,7 @@ def main():
     label_fg = ImageColor.getrgb(LABEL_FG)
     extensions = [e.lower() if e.startswith(".") else f".{e.lower()}" for e in EXTENSIONS]
 
-    # GradCAM dosyalarını indeksle
+    # Index GradCAM files
     run_indexes: Dict[RunSpec, Dict[str, Path]] = {}
     for run in RUN_SPECS:
         run_indexes[run] = collect_gradcam_index(run, GRADCAM_ROOTS, extensions, MATCH_MODE, VERBOSE)
@@ -251,16 +235,8 @@ def main():
         return
 
     combine_gradcam_sets(
-        RUN_SPECS,
-        run_indexes,
-        keys,
-        LAYOUT,
-        OUTPUT_DIR,
-        OUTPUT_SUFFIX,
-        font,
-        label_bg,
-        label_fg,
-        LABEL_PADDING,
+        RUN_SPECS, run_indexes, keys, LAYOUT, OUTPUT_DIR,
+        OUTPUT_SUFFIX, font, label_bg, label_fg, LABEL_PADDING
     )
 
     if INCLUDE_HISTORY:
@@ -275,7 +251,6 @@ def main():
             LABEL_PADDING,
         )
 
-    # ✅ NEW call
     if INCLUDE_TEST_CONFUSION_MATRIX:
         combine_test_confusion_matrices(
             RUN_SPECS,

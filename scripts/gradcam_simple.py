@@ -102,25 +102,8 @@ if __name__ == "__main__":
             print(f"❌ Error during analysis: {e}")
             sys.exit(1)
     else:
-        print(f"\n🎯 Running custom GradCAM analysis...")
-        test_dir = os.path.join(DATASET_ROOT, "test")
-        
-        if not os.path.exists(test_dir):
-            print(f"❌ Test directory not found: {test_dir}")
-            sys.exit(1)
-        
-        try:
-            analyze_subjects_gradcam(
-                model=model,
-                test_dir=test_dir,
-                output_dir=OUTPUT_DIR,
-                num_samples=NUM_SAMPLES,
-                seed=SEED,
-                include_buckets=("FP", "FN") if ONLY_FALSE else None
-            )
-        except Exception as e:
-            print(f"❌ Error during analysis: {e}")
-            sys.exit(1)
+        print(f"\n🎯 Error during analysis:")
+        sys.exit(1)
     
     print(f"\n✅ Analysis completed!")
     print(f"📁 Results saved to: {OUTPUT_DIR}")

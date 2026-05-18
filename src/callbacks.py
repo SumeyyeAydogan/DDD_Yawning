@@ -23,8 +23,8 @@ class CheckpointCallback(tf.keras.callbacks.Callback):
         # Save checkpoint
         self.run_manager.save_checkpoint(self.model, epoch_num)
         
-        # Save metrics
-        self.run_manager.save_metrics(self.model.history, epoch_num)
+        # Save metrics from Keras epoch logs
+        self.run_manager.save_metrics(logs, epoch_num)
         
         print(f"✅ Epoch {epoch_num} completed and checkpoint/metrics saved!")
 
@@ -245,8 +245,8 @@ def get_training_callbacks(run_manager, val_ds=None, gradcam_output_dir="gradcam
     """
     callbacks = [
         CheckpointCallback(run_manager),
-        #EarlyStopping(monitor='val_auc', patience=5, restore_best_weights=True),
-        ReduceLROnPlateau(monitor='val_auc', factor=0.5, patience=3, min_lr=1e-6)
+        EarlyStopping(monitor='val_auc', mode='max', patience=8, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_auc', mode='max', factor=0.5, patience=3, min_lr=1e-6)
     ]
 
     # Add sample weight monitoring if requested

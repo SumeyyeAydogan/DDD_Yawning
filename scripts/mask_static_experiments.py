@@ -31,12 +31,12 @@ from scripts.combine_images import combine_images
 # CONFIGURE HERE
 # =========================
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATASET_ROOT = os.path.join(PROJECT_ROOT, "splitted_dataset")
-class_name = "Drowsy"
+DATASET_ROOT = os.path.join(PROJECT_ROOT, "ydd_splitted_dataset")
+class_name = "Yawn"
 TEST_DIR = os.path.join(DATASET_ROOT, "test", class_name)
 SUBJECT_ONLY = "D" #"m" "zc" "ZC" "D" "d" "h" "w" "M" # Only files beginning with this prefix will be processed  a e u
 # "vertical_rectangles"  "original" "bottom_left" "top"
-mask_shape = "simple-eye_mouth-visualize"
+mask_shape = "simple_mouth-jaw-visualize"
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "masked_test", mask_shape, class_name, f"{SUBJECT_ONLY}")
 MAX_IMAGES = 5  # Set to an integer to limit number of processed images
 
@@ -49,11 +49,11 @@ RUN_GRADCAM = True
 MODEL_PATH = os.path.join(
     PROJECT_ROOT,
     "runs",
-    "30_epoch_without-mask_sbj-gradcam-fixed",
+    "baseline",
     "models",
     "final_model.h5",
 )
-CLASS_NAMES = ("NotDrowsy", "Drowsy")
+CLASS_NAMES = ("NoYawn", "Yawn")
 IMG_SIZE = (224, 224)  # expected model input size (W, H)
 
 if class_name == CLASS_NAMES[0]:
@@ -172,27 +172,27 @@ def visualize_eye_mouth_mask_simple(img: Image.Image, alpha=0.4) -> Image.Image:
 
     w, h = img.size
 
-    # ===== ROI Bölge sınırları =====
+    # ===== ROI region bounds =====
     eye_top    = int(h * 0.25)
     eye_bottom = int(h * 0.45)
 
     mouth_top  = int(h * 0.55)
     mouth_bot  = int(h * 0.80)
 
-    # ===== Yarı saydam renk bloğu =====
+    # ===== Semi-transparent color block =====
     overlay_color = (255, 0, 0)
     overlay_eye   = Image.new("RGB", (w, eye_bottom - eye_top), overlay_color)
     overlay_mouth = Image.new("RGB", (w, mouth_bot - mouth_top), overlay_color)
 
-    # ==== TEK KANALLI alpha maskesi =====
+    # ===== Single-channel alpha mask =====
     alpha_val = int(alpha * 255)
     alpha_mask_eye   = Image.new("L", (w, eye_bottom - eye_top), alpha_val)
     alpha_mask_mouth = Image.new("L", (w, mouth_bot - mouth_top), alpha_val)
 
-    # ===== Orijinal resmi kopyala =====
+    # ===== Copy of the original image =====
     out = img.copy()
 
-    # ===== Doğru maskeyle paste et =====
+    # ===== Paste with the correct mask =====
     out.paste(overlay_eye,   (0, eye_top),   alpha_mask_eye)
     out.paste(overlay_mouth, (0, mouth_top), alpha_mask_mouth)
 

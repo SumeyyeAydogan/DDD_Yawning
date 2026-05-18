@@ -14,7 +14,7 @@ from src.callbacks       import get_training_callbacks
 import splitfolders
 
 if __name__ == "__main__":
-    print("?? Starting Drowsy Driver Detection Project...")
+    print("?? Starting Yawning Detection Project...")
     print("=" * 50)
     
     # Project root directory: the folder where this file is located
@@ -32,7 +32,7 @@ if __name__ == "__main__":
     print(f"?? Data directory: {output_dir}")
 
     # 3) Create Train/Val/Test folder hierarchy
-    #    raw_dir contains => drowsy, notdrowsy
+    #    raw_dir contains => yawn, no_yawn
     #split_dataset(raw_dir, output_dir, classes=("NoYawn", "Yawn"), seed=42)
     #splitfolders.ratio(raw_dir, output=output_dir, seed=1337, ratio=(0.7, 0.15, 0.15))
     
@@ -67,6 +67,7 @@ if __name__ == "__main__":
     print("\n" + "=" * 50)
     print("📋 EXPERIMENT CONFIGURATION:")
     print("=" * 50)
+    print("  ✅ Sample Weight:        GradCAM JSON (if provided)")
     print("=" * 50 + "\n")
     
     print("✅ Datasets loaded successfully!")
